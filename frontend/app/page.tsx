@@ -47,6 +47,14 @@ export default function Home() {
   const [activeService, setActiveService] = useState<
     "jsearch" | "indeed" | "linkedin" | null
   >(null);
+  const [searchProgress, setSearchProgress] = useState<{
+    count: number;
+    maxResults: number;
+    status: string;
+  } | null>(null);
+  const [indeedRunId, setIndeedRunId] = useState<string | null>(null);
+  const [streamController, setStreamController] =
+    useState<AbortController | null>(null);
 
   const downloadCsv = () => {
     if (!jobs.length) return;
@@ -126,6 +134,16 @@ export default function Home() {
     e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement>
   ) => {
     const { name, value } = e.target;
+
+    // Prevent negative values for salary fields
+    if ((name === "salaryMin" || name === "salaryMax") && value !== "") {
+      const numValue = parseFloat(value);
+      if (numValue < 0) {
+        // Don't update if negative value
+        return;
+      }
+    }
+
     setFormData((prev: FormData) => ({
       ...prev,
       [name]: value,
@@ -137,32 +155,175 @@ export default function Home() {
     setError(null);
     setActiveService(service);
     setJobs([]);
+    setSearchProgress(null);
+    setIndeedRunId(null);
+
+    // Abort any existing stream
+    if (streamController) {
+      streamController.abort();
+      setStreamController(null);
+    }
 
     try {
-      const response = await fetch(`/api/${service}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(formData),
-      });
+      // Use SSE streaming for all services
+      // Create abort controller for this request
+      const abortController = new AbortController();
+      setStreamController(abortController);
 
-      const data = await response.json();
+      if (
+        service === "indeed" ||
+        service === "jsearch" ||
+        service === "linkedin"
+      ) {
+        // Use streaming endpoint for all services (use query param for all)
+        const endpoint = `/api/${service}?stream=true`;
 
-      if (!response.ok) {
-        throw new Error(data.error || `Failed to search with ${service}`);
-      }
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(formData),
+          signal: abortController.signal,
+        });
 
-      setJobs(data.jobs || []);
-      if (data.jobs && data.jobs.length === 0) {
-        setError("No jobs found. Try adjusting your search criteria.");
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(
+            errorData.error || `Failed to search with ${service}`
+          );
+        }
+
+        // Handle SSE stream
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
+
+        if (!reader) {
+          throw new Error("Response body is not readable");
+        }
+
+        let buffer = "";
+        let streamError = null;
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() || "";
+
+            for (const line of lines) {
+              if (line.trim() && line.startsWith("data: ")) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  console.log("Received SSE data:", data); // Debug log
+
+                  if (data.type === "start") {
+                    setSearchProgress({
+                      count: 0,
+                      maxResults: service === "jsearch" ? 15 : 20,
+                      status: "starting",
+                    });
+                  } else if (data.type === "progress") {
+                    setSearchProgress({
+                      count: data.count || 0,
+                      maxResults:
+                        data.max_results || (service === "jsearch" ? 15 : 20),
+                      status: data.status || "running",
+                    });
+                    // Store run_id if provided for abort functionality (Indeed only)
+                    if (data.run_id && service === "indeed") {
+                      setIndeedRunId(data.run_id);
+                    }
+                  } else if (data.type === "complete") {
+                    setJobs(data.jobs || []);
+                    setSearchProgress(null);
+                    if (data.jobs && data.jobs.length === 0) {
+                      setError(
+                        "No jobs found. Try adjusting your search criteria."
+                      );
+                    }
+                  } else if (data.type === "error") {
+                    streamError = new Error(
+                      data.message || "An error occurred"
+                    );
+                    break;
+                  }
+                } catch (e) {
+                  console.error("Error parsing SSE data:", e);
+                }
+              }
+            }
+            if (streamError) break;
+          }
+        } catch (streamErr: any) {
+          // Handle stream reading errors
+          // Ignore AbortError - it's expected when user cancels or connection closes
+          if (streamErr.name !== "AbortError") {
+            streamError = streamErr;
+          } else {
+            // Clean up on abort
+            setSearchProgress(null);
+            setLoading(false);
+            return;
+          }
+        }
+
+        if (streamError) {
+          throw streamError;
+        }
+      } else {
+        // Regular fetch for jsearch and linkedin
+        const response = await fetch(`/api/${service}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(formData),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || `Failed to search with ${service}`);
+        }
+
+        setJobs(data.jobs || []);
+        if (data.jobs && data.jobs.length === 0) {
+          setError("No jobs found. Try adjusting your search criteria.");
+        }
       }
     } catch (err: any) {
       setError(err.message || "An error occurred while searching for jobs");
       setJobs([]);
+      setSearchProgress(null);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleStopSearch = async () => {
+    // Abort the stream
+    if (streamController) {
+      streamController.abort();
+      setStreamController(null);
+    }
+
+    // Also abort on backend if we have run_id (Indeed only)
+    if (indeedRunId && activeService === "indeed") {
+      try {
+        await fetch(`/api/indeed/abort?run_id=${indeedRunId}`, {
+          method: "POST",
+        });
+      } catch (err) {
+        console.error("Error aborting search:", err);
+      }
+    }
+
+    setLoading(false);
+    setSearchProgress(null);
+    setIndeedRunId(null);
   };
 
   const disabledSearch = loading || !formData.jobTitle.trim();
@@ -194,15 +355,15 @@ export default function Home() {
               </span>
             </h1>
             <p className="max-w-xl text-sm leading-relaxed text-zinc-300 sm:text-[15px]">
-              Surface engineering roles by skills, salary band, and
-              location—without the noisy job board clutter.
+              Surface job roles by skills, salary band, and location—without the
+              noisy job board clutter.
             </p>
           </div>
 
           <div className="mb-6 grid gap-4 rounded-2xl border border-white/10 bg-black/30 p-4 text-xs text-zinc-300 sm:grid-cols-3 sm:gap-3 sm:p-5">
             <div className="flex items-center gap-2">
-              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-sky-500/20 text-sky-300">
-                <span className="text-[13px]">1</span>
+              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-sky-500/20 text-sky-300 aspect-square">
+                <span className="text-[13px] leading-none">1</span>
               </div>
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
@@ -212,21 +373,19 @@ export default function Home() {
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-300">
-                <span className="text-[13px]">2</span>
+              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-emerald-500/20 text-emerald-300 aspect-square">
+                <span className="text-[13px] leading-none">2</span>
               </div>
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
                   Scan
                 </p>
-                <p className="text-[13px]">
-                  Hit Platform 1 / Platform 2 / LinkedIn
-                </p>
+                <p className="text-[13px]">Hit LinkedIn / JSearch / Indeed</p>
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-500/20 text-indigo-300">
-                <span className="text-[13px]">3</span>
+              <div className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-500/20 text-indigo-300 aspect-square">
+                <span className="text-[13px] leading-none">3</span>
               </div>
               <div>
                 <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-zinc-400">
@@ -256,7 +415,7 @@ export default function Home() {
                   value={formData.jobTitle}
                   onChange={handleInputChange}
                   placeholder="e.g., Staff Frontend Engineer"
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3.5 py-2.5 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3.5 py-2.5 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
                   required
                 />
               </div>
@@ -278,7 +437,7 @@ export default function Home() {
                   value={formData.industry}
                   onChange={handleInputChange}
                   placeholder="e.g., Developer tools / AI infra"
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3.5 py-2.5 text-sm text-zinc-50 outline-none ring-0 transition focus:border-emerald-400/70 focus:ring-2 focus:ring-emerald-500/50"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3.5 py-2.5 text-sm text-zinc-50 outline-none ring-0 transition focus:border-emerald-400/70 focus:ring-2 focus:ring-emerald-500/50"
                 />
               </div>
             </div>
@@ -298,7 +457,9 @@ export default function Home() {
                   value={formData.salaryMin}
                   onChange={handleInputChange}
                   placeholder="80,000"
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
+                  min="0"
+                  step="1000"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
                 />
               </div>
 
@@ -316,7 +477,9 @@ export default function Home() {
                   value={formData.salaryMax}
                   onChange={handleInputChange}
                   placeholder="220,000"
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
+                  min="0"
+                  step="1000"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
                 />
               </div>
 
@@ -332,7 +495,7 @@ export default function Home() {
                   name="jobType"
                   value={formData.jobType}
                   onChange={handleInputChange}
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-emerald-400/70 focus:ring-2 focus:ring-emerald-500/50"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-emerald-400/70 focus:ring-2 focus:ring-emerald-500/50"
                 >
                   <option value="">Any</option>
                   <option value="Remote">Remote</option>
@@ -355,7 +518,7 @@ export default function Home() {
                   name="datePosted"
                   value={formData.datePosted}
                   onChange={handleInputChange}
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-emerald-400/70 focus:ring-2 focus:ring-emerald-500/50"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-emerald-400/70 focus:ring-2 focus:ring-emerald-500/50"
                 >
                   <option value="">Any time</option>
                   <option value="day">Past 24 hours</option>
@@ -380,7 +543,7 @@ export default function Home() {
                   value={formData.city}
                   onChange={handleInputChange}
                   placeholder="San Francisco, London..."
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
                 />
               </div>
 
@@ -398,7 +561,7 @@ export default function Home() {
                   value={formData.country}
                   onChange={handleInputChange}
                   placeholder="US, UK, EU ..."
-                  className="w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
+                  className="w-full rounded-lg border border-white/30 bg-zinc-700/90 px-3 py-2 text-sm text-zinc-50 outline-none ring-0 transition focus:border-sky-400/70 focus:ring-2 focus:ring-sky-500/50"
                 />
               </div>
 
@@ -414,22 +577,31 @@ export default function Home() {
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,1)]" />
                 <span>
                   Searches run directly against{" "}
-                  <span className="font-medium text-zinc-200">
-                    your backend
-                  </span>
-                  .
+                  <span className="font-medium text-zinc-200">the server</span>.
                 </span>
               </div>
 
               <button
-                onClick={() => handleSearch("linkedin")}
-                disabled={disabledSearch}
-                className="inline-flex items-center justify-center gap-2 rounded-lg border border-indigo-400/60 bg-slate-900/70 px-4 py-2.5 text-sm font-semibold text-zinc-50 shadow-[0_10px_30px_rgba(30,64,175,0.75)] transition hover:border-sky-400/70 hover:bg-slate-900/80 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => {
+                  if (loading && activeService === "linkedin") {
+                    handleStopSearch();
+                  } else {
+                    handleSearch("linkedin");
+                  }
+                }}
+                disabled={
+                  disabledSearch && !(loading && activeService === "linkedin")
+                }
+                className={`inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-semibold text-zinc-50 transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                  loading && activeService === "linkedin"
+                    ? "border-red-400/60 bg-red-900/60 shadow-[0_10px_30px_rgba(127,29,29,0.75)] hover:border-red-400/80 hover:bg-red-900/70"
+                    : "border-indigo-400/60 bg-slate-900/70 shadow-[0_10px_30px_rgba(30,64,175,0.75)] hover:border-sky-400/70 hover:bg-slate-900/80"
+                }`}
               >
                 {loading && activeService === "linkedin" ? (
                   <span className="inline-flex items-center gap-2">
-                    <span className="h-3 w-3 animate-spin rounded-full border border-zinc-300 border-t-transparent" />
-                    <span>Scanning LinkedIn…</span>
+                    <span className="h-2 w-2 rounded-full bg-red-400" />
+                    <span className="cursor-pointer">Stop</span>
                   </span>
                 ) : (
                   <span className="inline-flex items-center gap-2">
@@ -440,14 +612,26 @@ export default function Home() {
               </button>
               <div className="flex flex-col gap-2 sm:flex-row sm:gap-3">
                 <button
-                  onClick={() => handleSearch("jsearch")}
-                  disabled={disabledSearch}
-                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-sky-400/60 bg-slate-900/60 px-4 py-2.5 text-sm font-semibold text-zinc-50 shadow-[0_10px_35px_rgba(56,189,248,0.85)] transition hover:border-sky-400/80 hover:bg-slate-900/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => {
+                    if (loading && activeService === "jsearch") {
+                      handleStopSearch();
+                    } else {
+                      handleSearch("jsearch");
+                    }
+                  }}
+                  disabled={
+                    disabledSearch && !(loading && activeService === "jsearch")
+                  }
+                  className={`inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-semibold text-zinc-50 transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                    loading && activeService === "jsearch"
+                      ? "border-red-400/60 bg-red-900/60 shadow-[0_10px_30px_rgba(127,29,29,0.75)] hover:border-red-400/80 hover:bg-red-900/70"
+                      : "border-sky-400/60 bg-slate-900/60 shadow-[0_10px_35px_rgba(56,189,248,0.85)] hover:border-sky-400/80 hover:bg-slate-900/70"
+                  }`}
                 >
                   {loading && activeService === "jsearch" ? (
                     <span className="inline-flex items-center gap-2">
-                      <span className="h-3 w-3 animate-spin rounded-full border border-slate-300 border-t-transparent" />
-                      <span>Scanning globally…</span>
+                      <span className="h-2 w-2 rounded-full bg-red-400" />
+                      <span className="cursor-pointer">Stop</span>
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-2">
@@ -458,14 +642,26 @@ export default function Home() {
                 </button>
 
                 <button
-                  onClick={() => handleSearch("indeed")}
-                  disabled={disabledSearch}
-                  className="inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-400/60 bg-slate-900/60 px-4 py-2.5 text-sm font-semibold text-zinc-50 shadow-[0_10px_30px_rgba(6,95,70,0.85)] transition hover:border-emerald-400/80 hover:bg-slate-900/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => {
+                    if (loading && activeService === "indeed") {
+                      handleStopSearch();
+                    } else {
+                      handleSearch("indeed");
+                    }
+                  }}
+                  disabled={
+                    disabledSearch && !(loading && activeService === "indeed")
+                  }
+                  className={`inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2.5 text-sm font-semibold text-zinc-50 transition disabled:cursor-not-allowed disabled:opacity-50 ${
+                    loading && activeService === "indeed"
+                      ? "border-red-400/60 bg-red-900/60 shadow-[0_10px_30px_rgba(127,29,29,0.75)] hover:border-red-400/80 hover:bg-red-900/70"
+                      : "border-emerald-400/60 bg-slate-900/60 shadow-[0_10px_30px_rgba(6,95,70,0.85)] hover:border-emerald-400/80 hover:bg-slate-900/70"
+                  }`}
                 >
                   {loading && activeService === "indeed" ? (
                     <span className="inline-flex items-center gap-2">
-                      <span className="h-3 w-3 animate-spin rounded-full border border-zinc-400 border-t-transparent" />
-                      <span>Scanning Indeed…</span>
+                      <span className="h-2 w-2 rounded-full bg-red-400" />
+                      <span className="cursor-pointer">Stop</span>
                     </span>
                   ) : (
                     <span className="inline-flex items-center gap-2">
@@ -487,7 +683,7 @@ export default function Home() {
               Snapshot
             </p>
             <p className="text-balance text-sm text-zinc-100">
-              Design your search like a senior engineer: tighten your filters,
+              Design your search like a professional: tighten your filters,
               compare stacks, and export a focused shortlist you can actually
               work through.
             </p>
@@ -565,6 +761,65 @@ export default function Home() {
         </div>
       )}
 
+      {searchProgress && activeService && (
+        <div
+          className={`rounded-xl border px-4 py-3 text-sm shadow-[0_15px_35px_rgba(0,0,0,0.65)] sm:px-5 ${
+            activeService === "indeed"
+              ? "border-emerald-500/30 bg-emerald-950/20 text-emerald-200"
+              : activeService === "jsearch"
+              ? "border-sky-500/30 bg-sky-950/20 text-sky-200"
+              : "border-blue-500/30 bg-blue-950/20 text-blue-200"
+          }`}
+        >
+          <div className="flex items-center gap-3">
+            <span
+              className={`h-2 w-2 animate-pulse rounded-full ${
+                activeService === "indeed"
+                  ? "bg-emerald-400"
+                  : activeService === "jsearch"
+                  ? "bg-sky-400"
+                  : "bg-blue-400"
+              }`}
+            />
+            <span>
+              Scanning{" "}
+              {activeService === "indeed"
+                ? "Indeed"
+                : activeService === "jsearch"
+                ? "JSearch"
+                : "LinkedIn"}
+              ... {searchProgress.count} / {searchProgress.maxResults} results
+              found
+            </span>
+          </div>
+          <div
+            className={`mt-2 h-1.5 w-full overflow-hidden rounded-full ${
+              activeService === "indeed"
+                ? "bg-emerald-900/50"
+                : activeService === "jsearch"
+                ? "bg-sky-900/50"
+                : "bg-blue-900/50"
+            }`}
+          >
+            <div
+              className={`h-full transition-all duration-300 ${
+                activeService === "indeed"
+                  ? "bg-emerald-400"
+                  : activeService === "jsearch"
+                  ? "bg-sky-400"
+                  : "bg-blue-400"
+              }`}
+              style={{
+                width: `${Math.min(
+                  (searchProgress.count / searchProgress.maxResults) * 100,
+                  100
+                )}%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
       <section className="space-y-4">
         {jobs.length > 0 && (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -580,11 +835,11 @@ export default function Home() {
                 Source:{" "}
                 <span className="font-medium text-zinc-200">
                   {activeService === "jsearch"
-                    ? "JSearch (RapidAPI)"
+                    ? "JSearch"
                     : activeService === "indeed"
                     ? "Indeed"
                     : activeService === "linkedin"
-                    ? "LinkedIn (JobSpy)"
+                    ? "LinkedIn"
                     : "Unknown"}
                 </span>
               </p>

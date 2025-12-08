@@ -1,7 +1,7 @@
 import logging
 import math
 from datetime import date, datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 
 from jobspy import scrape_jobs
 
@@ -32,6 +32,7 @@ def search_linkedin_jobs(
     country: str = "",
     date_posted: str = "",
     results_wanted: int = 20,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Use JobSpy to scrape LinkedIn jobs and return a list of JobPost-like dicts.
@@ -67,6 +68,13 @@ def search_linkedin_jobs(
         },
     )
 
+    # Report initial progress
+    if progress_callback:
+        try:
+            progress_callback(0, results_wanted, "Starting LinkedIn search...")
+        except Exception as e:
+            logger.debug(f"Progress callback error: {e}")
+
     jobs_df = scrape_jobs(
         site_name=["linkedin"],
         search_term=search_term,
@@ -76,6 +84,14 @@ def search_linkedin_jobs(
         linkedin_fetch_description=True,
         verbose=1,
     )
+    
+    # Report progress after scraping
+    if progress_callback:
+        try:
+            result_count = len(jobs_df) if hasattr(jobs_df, '__len__') else 0
+            progress_callback(result_count, results_wanted, "Processing results...")
+        except Exception as e:
+            logger.debug(f"Progress callback error: {e}")
 
     # JobSpy returns a pandas DataFrame – convert to list of dicts
     # and normalise the important fields we care about.
@@ -142,6 +158,14 @@ def search_linkedin_jobs(
             }
         )
 
+    # Final progress update
+    if progress_callback:
+        try:
+            final_count = len(normalized)
+            progress_callback(final_count, results_wanted, "Complete")
+        except Exception as e:
+            logger.debug(f"Progress callback error: {e}")
+    
     return normalized
 
 

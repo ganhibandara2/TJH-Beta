@@ -6,6 +6,10 @@ const API_KEY = process.env.NEXT_PUBLIC_API_KEY || process.env.API_KEY || "";
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
+    const url = new URL(request.url);
+    const useStream =
+      url.searchParams.get("stream") === "true" ||
+      url.pathname.includes("/stream");
 
     // Forward the request to the backend
     const headers: HeadersInit = {
@@ -17,7 +21,12 @@ export async function POST(request: NextRequest) {
       headers["X-API-Key"] = API_KEY;
     }
 
-    const response = await fetch(`${BACKEND_URL}/api/jobs/linkedin`, {
+    // Use streaming endpoint if requested
+    const endpoint = useStream
+      ? `${BACKEND_URL}/api/jobs/linkedin/stream`
+      : `${BACKEND_URL}/api/jobs/linkedin`;
+
+    const response = await fetch(endpoint, {
       method: "POST",
       headers,
       body: JSON.stringify(body),
@@ -36,6 +45,17 @@ export async function POST(request: NextRequest) {
         },
         { status: response.status }
       );
+    }
+
+    // If streaming, return the stream as-is
+    if (useStream && response.body) {
+      return new NextResponse(response.body, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
     }
 
     const data = await response.json();
