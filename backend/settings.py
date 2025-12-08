@@ -1,6 +1,8 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List
+from pydantic import field_validator
+from typing import List, Union
 import os
+import json
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -45,6 +47,42 @@ class Settings(BaseSettings):
     
     # Environment
     ENVIRONMENT: str = "development"  # development, staging, production
+    
+    @field_validator("CORS_ORIGINS", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v: Union[str, List[str], None]) -> List[str]:
+        """
+        Parse CORS_ORIGINS from environment variable.
+        Supports:
+        - JSON format: ["url1", "url2"]
+        - Comma-separated: "url1,url2" or "url1, url2"
+        - Empty string: uses default localhost origins
+        """
+        # If already a list, return as-is
+        if isinstance(v, list):
+            return v
+        
+        # If None or empty string, return default
+        if not v or (isinstance(v, str) and not v.strip()):
+            return ["http://localhost:3000", "http://localhost:3001"]
+        
+        # Try to parse as JSON first
+        if isinstance(v, str):
+            v = v.strip()
+            # Try JSON parsing
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(item).strip() for item in parsed if item]
+                elif isinstance(parsed, str):
+                    # Single string, treat as comma-separated
+                    return [item.strip() for item in parsed.split(",") if item.strip()]
+            except (json.JSONDecodeError, ValueError):
+                # Not JSON, treat as comma-separated string
+                return [item.strip() for item in v.split(",") if item.strip()]
+        
+        # Fallback to default
+        return ["http://localhost:3000", "http://localhost:3001"]
     
     def validate_required(self) -> None:
         """Validate that required environment variables are set based on environment."""
