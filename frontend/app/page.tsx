@@ -47,6 +47,14 @@ export default function Home() {
   const [activeService, setActiveService] = useState<
     "jsearch" | "indeed" | "linkedin" | null
   >(null);
+  const [indeedProgress, setIndeedProgress] = useState<{
+    count: number;
+    maxResults: number;
+    status: string;
+  } | null>(null);
+  const [indeedRunId, setIndeedRunId] = useState<string | null>(null);
+  const [indeedStreamController, setIndeedStreamController] =
+    useState<AbortController | null>(null);
 
   const downloadCsv = () => {
     if (!jobs.length) return;
@@ -137,32 +145,142 @@ export default function Home() {
     setError(null);
     setActiveService(service);
     setJobs([]);
+    setIndeedProgress(null);
+    setIndeedRunId(null);
+
+    // Abort any existing stream
+    if (indeedStreamController) {
+      indeedStreamController.abort();
+      setIndeedStreamController(null);
+    }
 
     try {
-      const response = await fetch(`/api/${service}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(formData),
-      });
+      // Use SSE streaming for Indeed, regular fetch for others
+      if (service === "indeed") {
+        // Use streaming endpoint for Indeed
+        const response = await fetch(`/api/${service}?stream=true`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(formData),
+        });
 
-      const data = await response.json();
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(
+            errorData.error || `Failed to search with ${service}`
+          );
+        }
 
-      if (!response.ok) {
-        throw new Error(data.error || `Failed to search with ${service}`);
-      }
+        // Handle SSE stream
+        const reader = response.body?.getReader();
+        const decoder = new TextDecoder();
 
-      setJobs(data.jobs || []);
-      if (data.jobs && data.jobs.length === 0) {
-        setError("No jobs found. Try adjusting your search criteria.");
+        if (!reader) {
+          throw new Error("Response body is not readable");
+        }
+
+        let buffer = "";
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() || "";
+
+          for (const line of lines) {
+            if (line.trim() && line.startsWith("data: ")) {
+              try {
+                const data = JSON.parse(line.slice(6));
+                console.log("Received SSE data:", data); // Debug log
+
+                if (data.type === "start") {
+                  setIndeedProgress({
+                    count: 0,
+                    maxResults: 20,
+                    status: "starting",
+                  });
+                } else if (data.type === "progress") {
+                  console.log("Progress update:", data); // Debug log
+                  setIndeedProgress({
+                    count: data.count || 0,
+                    maxResults: data.max_results || 20,
+                    status: data.status || "running",
+                  });
+                  // Store run_id if provided for abort functionality
+                  if (data.run_id) {
+                    setIndeedRunId(data.run_id);
+                  }
+                } else if (data.type === "complete") {
+                  setJobs(data.jobs || []);
+                  setIndeedProgress(null);
+                  if (data.jobs && data.jobs.length === 0) {
+                    setError(
+                      "No jobs found. Try adjusting your search criteria."
+                    );
+                  }
+                } else if (data.type === "error") {
+                  throw new Error(data.message || "An error occurred");
+                }
+              } catch (e) {
+                console.error("Error parsing SSE data:", e);
+              }
+            }
+          }
+        }
+      } else {
+        // Regular fetch for jsearch and linkedin
+        const response = await fetch(`/api/${service}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(formData),
+        });
+
+        const data = await response.json();
+
+        if (!response.ok) {
+          throw new Error(data.error || `Failed to search with ${service}`);
+        }
+
+        setJobs(data.jobs || []);
+        if (data.jobs && data.jobs.length === 0) {
+          setError("No jobs found. Try adjusting your search criteria.");
+        }
       }
     } catch (err: any) {
       setError(err.message || "An error occurred while searching for jobs");
       setJobs([]);
+      setIndeedProgress(null);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleStopIndeed = async () => {
+    // Abort the stream first
+    if (indeedStreamController) {
+      indeedStreamController.abort();
+      setIndeedStreamController(null);
+    }
+
+    // Also abort on backend if we have run_id
+    if (indeedRunId) {
+      try {
+        await fetch(`/api/indeed/abort?run_id=${indeedRunId}`, {
+          method: "POST",
+        });
+      } catch (err) {
+        console.error("Error aborting search:", err);
+      }
+    }
+
+    setLoading(false);
+    setIndeedProgress(null);
+    setIndeedRunId(null);
   };
 
   const disabledSearch = loading || !formData.jobTitle.trim();
@@ -459,7 +577,9 @@ export default function Home() {
 
                 <button
                   onClick={() => handleSearch("indeed")}
-                  disabled={disabledSearch}
+                  disabled={
+                    disabledSearch || (loading && activeService === "indeed")
+                  }
                   className="inline-flex items-center justify-center gap-2 rounded-lg border border-emerald-400/60 bg-slate-900/60 px-4 py-2.5 text-sm font-semibold text-zinc-50 shadow-[0_10px_30px_rgba(6,95,70,0.85)] transition hover:border-emerald-400/80 hover:bg-slate-900/70 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {loading && activeService === "indeed" ? (
@@ -474,6 +594,15 @@ export default function Home() {
                     </span>
                   )}
                 </button>
+                {loading && activeService === "indeed" && (
+                  <button
+                    onClick={handleStopIndeed}
+                    className="inline-flex items-center justify-center gap-2 rounded-lg border border-red-400/60 bg-slate-900/60 px-4 py-2.5 text-sm font-semibold text-zinc-50 shadow-[0_10px_30px_rgba(127,29,29,0.85)] transition hover:border-red-400/80 hover:bg-slate-900/70"
+                  >
+                    <span className="h-1.5 w-1.5 rounded-full bg-red-400" />
+                    <span>Stop</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -562,6 +691,37 @@ export default function Home() {
       {error && (
         <div className="rounded-xl border border-red-500/30 bg-red-950/60 px-4 py-3 text-sm text-red-200 shadow-[0_15px_35px_rgba(127,29,29,0.65)] sm:px-5">
           {error}
+        </div>
+      )}
+
+      {indeedProgress && activeService === "indeed" && (
+        <div className="rounded-xl border border-emerald-500/30 bg-emerald-950/20 px-4 py-3 text-sm text-emerald-200 shadow-[0_15px_35px_rgba(6,95,70,0.65)] sm:px-5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <span className="h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
+              <span>
+                Crawling Indeed... {indeedProgress.count} /{" "}
+                {indeedProgress.maxResults} results found
+              </span>
+            </div>
+            <button
+              onClick={handleStopIndeed}
+              className="rounded px-2 py-1 text-xs font-medium text-red-300 hover:bg-red-500/20 transition"
+            >
+              Stop
+            </button>
+          </div>
+          <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-emerald-900/50">
+            <div
+              className="h-full bg-emerald-400 transition-all duration-300"
+              style={{
+                width: `${Math.min(
+                  (indeedProgress.count / indeedProgress.maxResults) * 100,
+                  100
+                )}%`,
+              }}
+            />
+          </div>
         </div>
       )}
 

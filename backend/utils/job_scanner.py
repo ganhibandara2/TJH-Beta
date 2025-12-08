@@ -266,7 +266,7 @@ def _check_job_matches_criteria(input_data: JobScannerInput, job: dict[str, Any]
     
     return True
 
-def scan_jobs(input_data: JobScannerInput, num_pages: int = 1, strict_filter: bool = False, min_match_threshold: float = 80.0) -> List[JobScannerOutput]:
+def scan_jobs(input_data: JobScannerInput, num_pages: int = 1, strict_filter: bool = False, min_match_threshold: float = 80.0, progress_callback: Optional[Callable[[int, int, str], None]] = None) -> List[JobScannerOutput]:
     """
     Scans for jobs using JSearch API based on input criteria.
     

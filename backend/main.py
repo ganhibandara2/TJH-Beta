@@ -2,18 +2,21 @@ import asyncio
 import logging
 import logging.config
 import sys
+import json
+import queue
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from settings import settings, RAPID_API_KEY
 from models.schemas import JobScannerInput, JobScannerOutput, JobScannerResponse
 from utils.job_scanner import scan_jobs
-from utils.indeed_service import search_indeed_jobs, normalize_indeed_job
+from utils.indeed_service import search_indeed_jobs, normalize_indeed_job, abort_indeed_run, get_indeed_run_status
 from utils.linkedin_jobspy_service import search_linkedin_jobs
 from services.cache_service import JobCache
 from middleware import RequestIDMiddleware, RateLimitMiddleware, APIKeyAuthMiddleware
@@ -534,6 +537,240 @@ async def search_jobs_indeed_endpoint(request: JobSearchRequest):
     except Exception as e:
         log_error_with_context(e, "indeed", request.model_dump() if hasattr(request, 'model_dump') else {})
         raise handle_exception(e, "indeed")
+
+@app.post("/api/jobs/indeed/stream")
+async def search_jobs_indeed_stream(request: JobSearchRequest):
+    """
+    Search for jobs using Indeed scraper with Server-Sent Events (SSE) for progress updates.
+    Streams progress updates and final results.
+    """
+    async def generate():
+        try:
+            # Skip cache for streaming endpoint (always fresh results)
+            # Build location string from city and country
+            location_parts = []
+            if request.city:
+                location_parts.append(request.city)
+            if request.country:
+                location_parts.append(request.country)
+            location = ", ".join(location_parts) if location_parts else (request.country or "")
+            
+            max_results = 20
+            # Use thread-safe queue for progress updates (larger size to prevent blocking)
+            progress_queue = queue.Queue(maxsize=100)
+            run_id_ref = {"value": None}  # Use dict to allow modification from nested function
+            
+            def progress_callback(count: int, max_count: int, status: str, run_id: Optional[str] = None):
+                """Callback to report progress - called from executor thread"""
+                try:
+                    if run_id and run_id_ref["value"] is None:
+                        run_id_ref["value"] = run_id
+                    progress_queue.put_nowait({
+                        "type": "progress",
+                        "count": count,
+                        "max_results": max_count,
+                        "status": status,
+                        "run_id": run_id or run_id_ref["value"]
+                    })
+                except queue.Full:
+                    pass  # Queue full, skip this update
+            
+            # Start the search in executor
+            loop = asyncio.get_event_loop()
+            
+            # Send initial message
+            yield f"data: {json.dumps({'type': 'start', 'message': 'Starting Indeed job search...'})}\n\n"
+            
+            # Send initial progress update
+            yield f"data: {json.dumps({
+                'type': 'progress',
+                'count': 0,
+                'max_results': max_results,
+                'status': 'starting',
+                'run_id': None
+            })}\n\n"
+            
+            # Wait a bit for run_id to be set
+            await asyncio.sleep(0.5)
+            
+            # Run search in background
+            search_task = loop.run_in_executor(
+                None,
+                search_indeed_jobs,
+                request.jobTitle,
+                location,
+                max_results,
+                request.datePosted or None,
+                None,  # actor_id
+                progress_callback
+            )
+            
+            # Monitor progress while search runs
+            last_count = -1  # Start at -1 so first update (0) always sends
+            last_status = None
+            last_update_time = 0
+            import time as time_module
+            
+            while not search_task.done():
+                try:
+                    # Check for progress updates (non-blocking)
+                    # Process all available updates, but only send the latest one
+                    latest_progress = None
+                    current_time = time_module.time()
+                    
+                    # Drain the queue and keep only the latest update
+                    while True:
+                        try:
+                            progress_data = progress_queue.get_nowait()
+                            # Store run_id if provided
+                            if progress_data.get("run_id") and run_id_ref["value"] is None:
+                                run_id_ref["value"] = progress_data["run_id"]
+                            latest_progress = progress_data  # Keep the latest
+                        except queue.Empty:
+                            break
+                    
+                    # Send update if we have one and it meets criteria
+                    if latest_progress:
+                        current_count = latest_progress["count"]
+                        current_status = latest_progress.get("status")
+                        
+                        # Send update if:
+                        # 1. Count increased, OR
+                        # 2. Status changed, OR
+                        # 3. It's been more than 1.5 seconds since last update (heartbeat to show it's alive)
+                        should_send = (
+                            current_count > last_count or 
+                            current_status != last_status or
+                            (current_time - last_update_time) >= 1.5
+                        )
+                        
+                        if should_send:
+                            yield f"data: {json.dumps(latest_progress)}\n\n"
+                            last_count = current_count
+                            last_status = current_status
+                            last_update_time = current_time
+                    
+                    # Small delay to prevent busy waiting
+                    await asyncio.sleep(0.3)  # Check every 0.3 seconds
+                except Exception as e:
+                    logger.warning(f"Error monitoring progress: {e}")
+            
+            # Get results
+            jobs_data = await search_task
+            
+            # Normalize and convert to response format
+            job_responses = []
+            seen_ids = set()
+            
+            for idx, job in enumerate(jobs_data[:30]):
+                normalized = normalize_indeed_job(job)
+                
+                # Build location string
+                loc_parts = []
+                if normalized.get("city"):
+                    loc_parts.append(normalized["city"])
+                if normalized.get("state"):
+                    loc_parts.append(normalized["state"])
+                if normalized.get("country"):
+                    loc_parts.append(normalized["country"])
+                location_str = ", ".join(loc_parts) if loc_parts else normalized.get("location", "")
+                
+                # Handle remote field
+                remote_value = normalized.get("remote", False)
+                if isinstance(remote_value, str):
+                    remote_value = remote_value.lower() in ["true", "yes", "remote", "1"]
+                elif not isinstance(remote_value, bool):
+                    remote_value = False
+                
+                # Generate unique ID
+                base_id = normalized.get("job_id", "")
+                if not base_id:
+                    base_id = f"indeed_{idx}"
+                
+                job_id = base_id
+                counter = 0
+                while job_id in seen_ids:
+                    counter += 1
+                    job_id = f"{base_id}_{counter}"
+                
+                seen_ids.add(job_id)
+                
+                job_responses.append({
+                    "id": f"indeed_{job_id}",
+                    "title": normalized.get("title", ""),
+                    "company": normalized.get("company", ""),
+                    "location": location_str,
+                    "city": normalized.get("city", ""),
+                    "state": normalized.get("state", ""),
+                    "country": normalized.get("country", ""),
+                    "salary": normalized.get("salary", ""),
+                    "type": normalized.get("employment_type", ""),
+                    "remote": remote_value,
+                    "posted": normalized.get("date_posted", ""),
+                    "description": normalized.get("description", "")[:500] if normalized.get("description") else "",
+                    "applyLink": normalized.get("link", "")
+                })
+            
+            # Send final results
+            yield f"data: {json.dumps({'type': 'complete', 'jobs': job_responses, 'total': len(job_responses)})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Error in Indeed stream: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable buffering in nginx
+        }
+    )
+
+@app.post("/api/jobs/indeed/abort/{run_id}")
+async def abort_indeed_search(run_id: str):
+    """
+    Abort a running Indeed job search.
+    
+    Args:
+        run_id: The Apify run ID to abort
+    
+    Returns:
+        Success status
+    """
+    try:
+        success = abort_indeed_run(run_id)
+        if success:
+            return {"success": True, "message": f"Run {run_id} aborted successfully"}
+        else:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found or could not be aborted")
+    except Exception as e:
+        logger.error(f"Error aborting Indeed run {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to abort run: {str(e)}")
+
+@app.get("/api/jobs/indeed/status/{run_id}")
+async def get_indeed_search_status(run_id: str):
+    """
+    Get the current status of an Indeed job search.
+    
+    Args:
+        run_id: The Apify run ID
+    
+    Returns:
+        Status information including results count
+    """
+    try:
+        status = get_indeed_run_status(run_id)
+        if status:
+            return status
+        else:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting Indeed run status {run_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
 
 def get_country_code(country_name: str) -> Optional[str]:
     """Convert country name to country code"""
