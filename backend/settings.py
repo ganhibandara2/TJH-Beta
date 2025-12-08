@@ -1,6 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
-from typing import List, Union
+from typing import List
 import os
 import json
 
@@ -42,15 +41,27 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
     LOG_FORMAT: str = "json"  # "json" or "text"
     
-    # CORS
-    CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:3001"]
+    # CORS - stored as string to avoid Pydantic's automatic JSON parsing
+    CORS_ORIGINS_RAW: str = ""
     
     # Environment
     ENVIRONMENT: str = "development"  # development, staging, production
     
-    @field_validator("CORS_ORIGINS", mode="before")
-    @classmethod
-    def parse_cors_origins(cls, v: Union[str, List[str], None]) -> List[str]:
+    def __init__(self, **kwargs):
+        # Intercept CORS_ORIGINS before Pydantic processes it
+        if "CORS_ORIGINS" in kwargs:
+            kwargs["CORS_ORIGINS_RAW"] = str(kwargs.pop("CORS_ORIGINS"))
+        elif "cors_origins" in kwargs:
+            kwargs["CORS_ORIGINS_RAW"] = str(kwargs.pop("cors_origins"))
+        else:
+            # Check environment variable
+            env_value = os.getenv("CORS_ORIGINS", "")
+            if env_value:
+                kwargs["CORS_ORIGINS_RAW"] = env_value
+        super().__init__(**kwargs)
+    
+    @property
+    def CORS_ORIGINS(self) -> List[str]:
         """
         Parse CORS_ORIGINS from environment variable.
         Supports:
@@ -58,28 +69,25 @@ class Settings(BaseSettings):
         - Comma-separated: "url1,url2" or "url1, url2"
         - Empty string: uses default localhost origins
         """
-        # If already a list, return as-is
-        if isinstance(v, list):
-            return v
+        raw_value = self.CORS_ORIGINS_RAW or os.getenv("CORS_ORIGINS", "")
         
-        # If None or empty string, return default
-        if not v or (isinstance(v, str) and not v.strip()):
+        # If empty, return default
+        if not raw_value or not raw_value.strip():
             return ["http://localhost:3000", "http://localhost:3001"]
         
+        raw_value = raw_value.strip()
+        
         # Try to parse as JSON first
-        if isinstance(v, str):
-            v = v.strip()
-            # Try JSON parsing
-            try:
-                parsed = json.loads(v)
-                if isinstance(parsed, list):
-                    return [str(item).strip() for item in parsed if item]
-                elif isinstance(parsed, str):
-                    # Single string, treat as comma-separated
-                    return [item.strip() for item in parsed.split(",") if item.strip()]
-            except (json.JSONDecodeError, ValueError):
-                # Not JSON, treat as comma-separated string
-                return [item.strip() for item in v.split(",") if item.strip()]
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if item]
+            elif isinstance(parsed, str):
+                # Single string from JSON, treat as comma-separated
+                return [item.strip() for item in parsed.split(",") if item.strip()]
+        except (json.JSONDecodeError, ValueError):
+            # Not JSON, treat as comma-separated string
+            return [item.strip() for item in raw_value.split(",") if item.strip()]
         
         # Fallback to default
         return ["http://localhost:3000", "http://localhost:3001"]
