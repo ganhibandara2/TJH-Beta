@@ -146,11 +146,37 @@ class JobSearchRequest(BaseModel):
     @field_validator("salaryMin", "salaryMax")
     @classmethod
     def validate_salary(cls, v: Optional[str]) -> Optional[str]:
-        """Validate salary format."""
+        """Validate salary format and ensure non-negative values."""
         if not v or not v.strip():
             return ""
-        # Allow numbers, $, commas, and common formats
-        sanitized = "".join(c for c in v if c.isdigit() or c in ['$', ',', '.', 'k', 'K', '+', '-'])
+        
+        # Remove common formatting characters to extract numeric value
+        cleaned = v.replace('$', '').replace(',', '').replace(' ', '').strip()
+        
+        # Check if the value starts with a negative sign
+        if cleaned.startswith('-'):
+            raise ValueError(f"Salary cannot be negative. Received: {v}")
+        
+        # Try to parse as float to check if it's negative
+        try:
+            # Handle 'k' and 'K' suffix (e.g., "100k" = 100000)
+            multiplier = 1
+            if cleaned.lower().endswith('k'):
+                multiplier = 1000
+                cleaned = cleaned[:-1]
+            
+            # Extract just the numeric part
+            numeric_part = ''.join(c for c in cleaned if c.isdigit() or c == '.')
+            if numeric_part:
+                num_value = float(numeric_part) * multiplier
+                if num_value < 0:
+                    raise ValueError(f"Salary cannot be negative. Received: {v}")
+        except (ValueError, AttributeError):
+            # If parsing fails, allow it through (might be formatted string like "100k+")
+            pass
+        
+        # Allow numbers, $, commas, and common formats (but not negative sign)
+        sanitized = "".join(c for c in v if c.isdigit() or c in ['$', ',', '.', 'k', 'K', '+'])
         return sanitized[:20]
     
     @field_validator("datePosted")
@@ -235,6 +261,273 @@ async def health():
     # Return appropriate status code
     status_code = 200 if health_status["status"] == "healthy" else 503
     return health_status
+
+@app.post("/api/jobs/jsearch/stream")
+async def search_jobs_jsearch_stream(request: JobSearchRequest):
+    """
+    Search for jobs using JSearch with Server-Sent Events (SSE) for progress updates.
+    """
+    async def generate():
+        try:
+            # ---------- CACHE CHECK ----------
+            cache_payload = request.model_dump()
+            cached, hit = cache.get("jsearch", cache_payload)
+            if hit and cached and cached.data.get("jobs"):
+                logger.info(f"JSearch cache hit (streaming) - {len(cached.data.get('jobs', []))} jobs")
+                # Return cached data immediately as complete event
+                yield f"data: {json.dumps({'type': 'start', 'message': 'Cache hit, returning cached results...'})}\n\n"
+                yield f"data: {json.dumps({
+                    'type': 'progress',
+                    'count': len(cached.data.get("jobs", [])),
+                    'max_results': 15,
+                    'status': 'complete'
+                })}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'jobs': cached.data.get("jobs", []), 'total': cached.data.get("total", 0)})}\n\n"
+                return
+            logger.info("JSearch cache miss (streaming)")
+            
+            # Build location string from city and country
+            location_parts = []
+            if request.city:
+                location_parts.append(request.city)
+            if request.country:
+                location_parts.append(request.country)
+            location = ", ".join(location_parts) if location_parts else (request.country or "")
+            
+            max_results = 15  # JSearch limit
+            progress_queue = queue.Queue(maxsize=100)
+            
+            def progress_callback(count: int, max_count: int, status: str):
+                """Callback to report progress"""
+                try:
+                    progress_queue.put_nowait({
+                        "type": "progress",
+                        "count": count,
+                        "max_results": max_count,
+                        "status": status
+                    })
+                except queue.Full:
+                    pass
+            
+            # Send initial message
+            yield f"data: {json.dumps({'type': 'start', 'message': 'Starting JSearch...'})}\n\n"
+            yield f"data: {json.dumps({
+                'type': 'progress',
+                'count': 0,
+                'max_results': max_results,
+                'status': 'starting'
+            })}\n\n"
+            
+            # Start search in executor
+            loop = asyncio.get_event_loop()
+            
+            # Build scanner input
+            job_type_mapping = {
+                "Remote": "Remote",
+                "On-site": "On site",
+                "Hybrid": "Hybrid",
+                "Full-time": "Remote",
+                "Part-time": "Remote",
+            }
+            job_type = job_type_mapping.get(request.jobType, "Remote")
+            
+            salary_range = ""
+            if request.salaryMin or request.salaryMax:
+                if request.salaryMin and request.salaryMax:
+                    salary_range = f"${request.salaryMin} - ${request.salaryMax}"
+                elif request.salaryMin:
+                    salary_range = f"${request.salaryMin}+"
+                elif request.salaryMax:
+                    salary_range = f"Up to ${request.salaryMax}"
+            
+            scanner_input = JobScannerInput(
+                job_title=request.jobTitle,
+                industry=request.industry or "",
+                salary_range=salary_range,
+                job_type=job_type,
+                location_city=request.city or "",
+                location_state="",
+                country=request.country.upper() if request.country else "US",
+                date_posted=request.datePosted or ""
+            )
+            
+            # Run search
+            search_task = loop.run_in_executor(
+                None,
+                scan_jobs,
+                scanner_input,
+                2,  # num_pages
+                True,  # strict_filter
+                80.0,  # min_match_threshold
+                progress_callback
+            )
+            
+            # Monitor progress
+            last_count = -1
+            last_status = None
+            last_update_time = 0
+            import time as time_module
+            
+            while not search_task.done():
+                try:
+                    latest_progress = None
+                    current_time = time_module.time()
+                    
+                    while True:
+                        try:
+                            progress_data = progress_queue.get_nowait()
+                            latest_progress = progress_data
+                        except queue.Empty:
+                            break
+                    
+                    if latest_progress:
+                        current_count = latest_progress["count"]
+                        current_status = latest_progress.get("status")
+                        
+                        should_send = (
+                            current_count > last_count or 
+                            current_status != last_status or
+                            (current_time - last_update_time) >= 1.5
+                        )
+                        
+                        if should_send:
+                            yield f"data: {json.dumps(latest_progress)}\n\n"
+                            last_count = current_count
+                            last_status = current_status
+                            last_update_time = current_time
+                    
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"Error monitoring progress: {e}")
+            
+            # Get results
+            try:
+                filtered_jobs = await search_task
+            except Exception as task_error:
+                logger.error(f"Error in JSearch search task: {task_error}")
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Search failed: {str(task_error)}'})}\n\n"
+                return
+            
+            # Process and convert to response format (same as non-streaming endpoint)
+            # Get raw job data to extract company and description
+            url = "https://jsearch.p.rapidapi.com/search"
+            headers = {
+                "X-RapidAPI-Key": RAPID_API_KEY,
+                "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
+            }
+            
+            query_parts = [scanner_input.job_title]
+            if scanner_input.industry:
+                query_parts.append(scanner_input.industry)
+            query = " ".join(query_parts)
+            
+            location_parts = []
+            if scanner_input.location_city:
+                location_parts.append(scanner_input.location_city)
+            location = ", ".join(location_parts) if location_parts else ""
+            
+            remote_jobs_only = None
+            if scanner_input.job_type == "Remote":
+                remote_jobs_only = "true"
+            elif scanner_input.job_type == "On site":
+                remote_jobs_only = "false"
+            
+            date_posted = "all"
+            if scanner_input.date_posted:
+                date_lower = scanner_input.date_posted.lower()
+                if "day" in date_lower or "today" in date_lower:
+                    date_posted = "day"
+                elif "week" in date_lower:
+                    date_posted = "week"
+                elif "month" in date_lower:
+                    date_posted = "month"
+            
+            raw_jobs_map = {}
+            for page in range(1, 3):
+                params = {
+                    "query": query,
+                    "page": str(page),
+                    "num_pages": "1"
+                }
+                if location:
+                    params["location"] = location
+                if scanner_input.country:
+                    params["country"] = scanner_input.country.lower()
+                if remote_jobs_only:
+                    params["remote_jobs_only"] = remote_jobs_only
+                if date_posted != "all":
+                    params["date_posted"] = date_posted
+                
+                try:
+                    response = requests.get(
+                        url,
+                        headers=headers,
+                        params=params,
+                        timeout=REQUEST_TIMEOUT_SECONDS,
+                    )
+                    if response.status_code == 200:
+                        data = response.json()
+                        for job in data.get("data", []):
+                            apply_link = job.get("job_apply_link", "")
+                            if apply_link:
+                                raw_jobs_map[apply_link] = job
+                except requests.RequestException:
+                    pass
+            
+            job_responses = []
+            for idx, job in enumerate(filtered_jobs[:max_results]):
+                # Get raw job data if available
+                raw_job = raw_jobs_map.get(job.apply_link, {})
+                
+                # Build location string
+                location_parts = []
+                if job.location_city:
+                    location_parts.append(job.location_city)
+                if job.location_state:
+                    location_parts.append(job.location_state)
+                location_str = ", ".join(location_parts) if location_parts else ""
+                
+                # Extract description
+                description = raw_job.get('job_description', '') or raw_job.get('job_highlights', {}).get('summary', [None])[0] or ""
+                
+                job_responses.append({
+                    "id": f"jsearch_{idx}_{job.apply_link[:20]}" if job.apply_link else f"jsearch_{idx}",
+                    "title": job.job_title,
+                    "company": raw_job.get('employer_name', ''),
+                    "location": location_str,
+                    "city": job.location_city or "",
+                    "state": job.location_state or "",
+                    "country": job.country or "",
+                    "salary": job.salary_range or "",
+                    "type": job.job_type or "",
+                    "remote": job.job_type == "Remote" if job.job_type else False,
+                    "posted": job.date_posted or "",
+                    "description": description[:500] if description else "",
+                    "applyLink": job.apply_link
+                })
+            
+            # Cache the results
+            response_data = {
+                "jobs": job_responses,
+                "total": len(job_responses)
+            }
+            cache.set("jsearch", cache_payload, response_data)
+            
+            yield f"data: {json.dumps({'type': 'complete', 'jobs': job_responses, 'total': len(job_responses)})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Error in JSearch stream: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 @app.post("/api/jobs/jsearch", response_model=JobSearchResponse)
 async def search_jobs_jsearch(request: JobSearchRequest):
@@ -546,7 +839,23 @@ async def search_jobs_indeed_stream(request: JobSearchRequest):
     """
     async def generate():
         try:
-            # Skip cache for streaming endpoint (always fresh results)
+            # ---------- CACHE CHECK ----------
+            cache_payload = request.model_dump()
+            cached, hit = cache.get("indeed", cache_payload)
+            if hit and cached and cached.data.get("jobs"):
+                logger.info(f"Indeed cache hit (streaming) - {len(cached.data.get('jobs', []))} jobs")
+                # Return cached data immediately as complete event
+                yield f"data: {json.dumps({'type': 'start', 'message': 'Cache hit, returning cached results...'})}\n\n"
+                yield f"data: {json.dumps({
+                    'type': 'progress',
+                    'count': len(cached.data.get("jobs", [])),
+                    'max_results': 20,
+                    'status': 'complete'
+                })}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'jobs': cached.data.get("jobs", []), 'total': cached.data.get("total", 0)})}\n\n"
+                return
+            logger.info("Indeed cache miss (streaming)")
+            
             # Build location string from city and country
             location_parts = []
             if request.city:
@@ -711,6 +1020,13 @@ async def search_jobs_indeed_stream(request: JobSearchRequest):
                     "applyLink": normalized.get("link", "")
                 })
             
+            # Cache the results
+            response_data = {
+                "jobs": job_responses,
+                "total": len(job_responses)
+            }
+            cache.set("indeed", cache_payload, response_data)
+            
             # Send final results
             yield f"data: {json.dumps({'type': 'complete', 'jobs': job_responses, 'total': len(job_responses)})}\n\n"
             
@@ -805,6 +1121,166 @@ def get_country_code(country_name: str) -> Optional[str]:
     normalized = country_name.lower().strip()
     return country_map.get(normalized, normalized.upper() if len(normalized) == 2 else None)
 
+
+@app.post("/api/jobs/linkedin/stream")
+async def search_jobs_linkedin_stream(request: JobSearchRequest):
+    """
+    Search for jobs using LinkedIn with Server-Sent Events (SSE) for progress updates.
+    """
+    async def generate():
+        try:
+            # ---------- CACHE CHECK ----------
+            cache_payload = request.model_dump()
+            cached, hit = cache.get("linkedin", cache_payload)
+            if hit and cached and cached.data.get("jobs"):
+                logger.info(f"LinkedIn cache hit (streaming) - {len(cached.data.get('jobs', []))} jobs")
+                # Return cached data immediately as complete event
+                yield f"data: {json.dumps({'type': 'start', 'message': 'Cache hit, returning cached results...'})}\n\n"
+                yield f"data: {json.dumps({
+                    'type': 'progress',
+                    'count': len(cached.data.get("jobs", [])),
+                    'max_results': 20,
+                    'status': 'complete'
+                })}\n\n"
+                yield f"data: {json.dumps({'type': 'complete', 'jobs': cached.data.get("jobs", []), 'total': cached.data.get("total", 0)})}\n\n"
+                return
+            logger.info("LinkedIn cache miss (streaming)")
+            
+            max_results = 20
+            progress_queue = queue.Queue(maxsize=100)
+            
+            def progress_callback(count: int, max_count: int, status: str):
+                """Callback to report progress"""
+                try:
+                    progress_queue.put_nowait({
+                        "type": "progress",
+                        "count": count,
+                        "max_results": max_count,
+                        "status": status
+                    })
+                except queue.Full:
+                    pass
+            
+            # Send initial message
+            yield f"data: {json.dumps({'type': 'start', 'message': 'Starting LinkedIn search...'})}\n\n"
+            yield f"data: {json.dumps({
+                'type': 'progress',
+                'count': 0,
+                'max_results': max_results,
+                'status': 'starting'
+            })}\n\n"
+            
+            # Start search in executor
+            loop = asyncio.get_event_loop()
+            
+            search_task = loop.run_in_executor(
+                None,
+                search_linkedin_jobs,
+                request.jobTitle,
+                request.industry or "",
+                request.city or "",
+                request.country or "",
+                request.datePosted or "",
+                max_results,
+                progress_callback
+            )
+            
+            # Monitor progress
+            last_count = -1
+            last_status = None
+            last_update_time = 0
+            import time as time_module
+            
+            while not search_task.done():
+                try:
+                    latest_progress = None
+                    current_time = time_module.time()
+                    
+                    while True:
+                        try:
+                            progress_data = progress_queue.get_nowait()
+                            latest_progress = progress_data
+                        except queue.Empty:
+                            break
+                    
+                    if latest_progress:
+                        current_count = latest_progress["count"]
+                        current_status = latest_progress.get("status")
+                        
+                        should_send = (
+                            current_count > last_count or 
+                            current_status != last_status or
+                            (current_time - last_update_time) >= 1.5
+                        )
+                        
+                        if should_send:
+                            yield f"data: {json.dumps(latest_progress)}\n\n"
+                            last_count = current_count
+                            last_status = current_status
+                            last_update_time = current_time
+                    
+                    await asyncio.sleep(0.3)
+                except Exception as e:
+                    logger.warning(f"Error monitoring progress: {e}")
+            
+            # Get results
+            try:
+                jobs_data = await search_task
+            except Exception as task_error:
+                logger.error(f"Error in LinkedIn search task: {task_error}")
+                yield f"data: {json.dumps({'type': 'error', 'message': f'Search failed: {str(task_error)}'})}\n\n"
+                return
+            
+            # Convert to response format
+            job_responses = []
+            for idx, job in enumerate(jobs_data[:max_results]):
+                loc_parts = []
+                if job.get("city"):
+                    loc_parts.append(job["city"])
+                if job.get("state"):
+                    loc_parts.append(job["state"])
+                if job.get("country"):
+                    loc_parts.append(job["country"])
+                location_str = ", ".join(loc_parts) if loc_parts else job.get("location", "")
+                
+                job_responses.append({
+                    "id": f"linkedin_{job.get('id', idx)}",
+                    "title": job.get("title", ""),
+                    "company": job.get("company", ""),
+                    "location": location_str,
+                    "city": job.get("city", ""),
+                    "state": job.get("state", ""),
+                    "country": job.get("country", ""),
+                    "salary": job.get("salary", ""),
+                    "type": job.get("type", ""),
+                    "remote": job.get("remote", False),
+                    "posted": job.get("posted", ""),
+                    "description": job.get("description", ""),
+                    "applyLink": job.get("applyLink", "")
+                })
+            
+            # Cache the results
+            response_data = {
+                "jobs": job_responses,
+                "total": len(job_responses)
+            }
+            cache.set("linkedin", cache_payload, response_data)
+            
+            yield f"data: {json.dumps({'type': 'complete', 'jobs': job_responses, 'total': len(job_responses)})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Error in LinkedIn stream: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 @app.post("/api/jobs/linkedin", response_model=JobSearchResponse)
 async def search_jobs_linkedin_endpoint(request: JobSearchRequest):

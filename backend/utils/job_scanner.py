@@ -3,7 +3,7 @@ import re
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Callable
 
 import requests
 
@@ -332,6 +332,13 @@ def scan_jobs(input_data: JobScannerInput, num_pages: int = 1, strict_filter: bo
     )
     
     for page in range(1, num_pages + 1):
+        # Report progress
+        if progress_callback:
+            try:
+                progress_callback(len(all_jobs), num_pages * 10, f"Fetching page {page}/{num_pages}")
+            except Exception as e:
+                logger.debug(f"Progress callback error: {e}")
+        
         params: dict[str, Any] = {
             "query": query,
             "page": str(page),
@@ -362,6 +369,16 @@ def scan_jobs(input_data: JobScannerInput, num_pages: int = 1, strict_filter: bo
                     "JSearch page fetched",
                     extra={"page": page, "jobs_on_page": len(jobs_data)},
                 )
+                
+                # Report progress after processing jobs
+                if progress_callback:
+                    try:
+                        # Estimate total: assume ~10 jobs per page
+                        estimated_total = num_pages * 10
+                        current_count = len(all_jobs) + len(jobs_data)
+                        progress_callback(current_count, estimated_total, f"Page {page}/{num_pages} processed")
+                    except Exception as e:
+                        logger.debug(f"Progress callback error: {e}")
 
                 for job in jobs_data:
                     # Apply filtering if enabled
@@ -437,5 +454,14 @@ def scan_jobs(input_data: JobScannerInput, num_pages: int = 1, strict_filter: bo
             )
 
     logger.info("Total jobs found", extra={"total": len(all_jobs)})
+    
+    # Final progress update
+    if progress_callback:
+        try:
+            final_count = len(all_jobs)
+            progress_callback(final_count, final_count, "Complete")
+        except Exception as e:
+            logger.debug(f"Progress callback error: {e}")
+    
     return all_jobs
 
