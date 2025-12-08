@@ -220,10 +220,14 @@ def search_indeed_jobs(
     
     # Check status of the scraping job until it's done
     status_url = f"https://api.apify.com/v2/acts/{actor}/runs/{run_id}?token={APIFY_API_KEY}"
+    abort_url = f"https://api.apify.com/v2/acts/{actor}/runs/{run_id}/abort?token={APIFY_API_KEY}"
     
-    logger.info("Waiting for Apify scraper to complete...")
+    logger.info(f"Waiting for Apify scraper to complete (max results: {max_results})...")
     max_wait_time = getattr(settings, 'INDEED_TIMEOUT', 120)  # Use configured timeout
     start_time = time.time()
+    run_aborted_by_us = False
+    dataset_id = None
+    last_count = 0
     
     while True:
         elapsed = time.time() - start_time
@@ -237,28 +241,93 @@ def search_indeed_jobs(
             status_data = status_response.json()
             status = status_data["data"]["status"]
             
+            # Get dataset ID on first check
+            if dataset_id is None:
+                dataset_id = status_data.get("data", {}).get("defaultDatasetId")
+                if dataset_id:
+                    logger.info(f"Monitoring dataset {dataset_id} for results...")
+            
+            # Check dataset count directly for accurate real-time count
+            dataset_item_count = 0
+            if dataset_id:
+                try:
+                    # Efficiently check count: fetch exactly max_results items to see if we have enough
+                    check_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?format=json&limit={max_results}&token={APIFY_API_KEY}"
+                    check_response = requests.get(check_url, timeout=5)
+                    if check_response.status_code == 200:
+                        check_data = check_response.json()
+                        dataset_item_count = len(check_data) if isinstance(check_data, list) else 0
+                except requests.RequestException:
+                    # Fallback to stats if dataset query fails
+                    stats = status_data.get("data", {}).get("stats", {})
+                    dataset_item_count = stats.get("datasetItemCount", 0)
+            else:
+                # Fallback to stats if dataset ID not available yet
+                stats = status_data.get("data", {}).get("stats", {})
+                dataset_item_count = stats.get("datasetItemCount", 0)
+            
+            # Log progress when count changes
+            if dataset_item_count > last_count:
+                logger.info(f"Apify run progress: {dataset_item_count} results collected (target: {max_results})")
+                last_count = dataset_item_count
+            
+            # Abort immediately when we reach or exceed max_results
+            if dataset_item_count >= max_results:
+                logger.warning(f"CRITICAL: Reached/exceeded target of {max_results} results ({dataset_item_count} found). Aborting run immediately!")
+                try:
+                    abort_response = requests.post(abort_url, timeout=5)
+                    abort_response.raise_for_status()
+                    run_aborted_by_us = True
+                    
+                    # Verify abort worked by checking status immediately
+                    time.sleep(0.3)
+                    verify_response = requests.get(status_url, timeout=5)
+                    if verify_response.status_code == 200:
+                        verify_data = verify_response.json()
+                        verify_status = verify_data.get("data", {}).get("status")
+                        if verify_status == "ABORTED":
+                            logger.info("Run aborted successfully and verified. Fetching results now...")
+                        else:
+                            logger.warning(f"Abort sent but status is still: {verify_status}. Proceeding anyway.")
+                    
+                    # Break out of loop to fetch results
+                    break
+                except requests.RequestException as abort_error:
+                    logger.error(f"Failed to abort run: {abort_error}. Attempting immediate retry...")
+                    # Try one more time immediately
+                    try:
+                        abort_response = requests.post(abort_url, timeout=5)
+                        abort_response.raise_for_status()
+                        run_aborted_by_us = True
+                        logger.info("Run aborted on retry. Fetching results now...")
+                        break
+                    except Exception as e:
+                        logger.error(f"Critical: Could not abort run after retry: {e}. Proceeding to fetch limited results.")
+                        break
+            
             if status in ["SUCCEEDED", "FAILED", "ABORTED"]:
                 break
             
-            logger.debug(f"Apify run status: {status}, waiting...")
-            time.sleep(3)  # Wait 3 seconds before checking again
+            time.sleep(0.5)  # Check every 0.5 seconds for faster response and earlier detection
         except requests.RequestException as e:
             logger.warning(f"Error checking Apify status: {e}")
-            time.sleep(3)
+            time.sleep(1)
             continue
     
-    # Check if run succeeded
+    # Check if run succeeded or was aborted
     if status == "FAILED":
         error_message = status_data.get("data", {}).get("statusMessage", "Unknown error")
         logger.error(f"Apify run failed: {error_message}")
         raise RuntimeError(f"Apify scraper failed: {error_message}")
-    elif status == "ABORTED":
-        logger.error("Apify run was aborted")
-        raise RuntimeError("Apify scraper was aborted")
+    elif status == "ABORTED" and not run_aborted_by_us:
+        logger.warning("Apify run was aborted (not by us)")
     
-    # Get the dataset ID (where results are stored)
-    dataset_id = status_data["data"]["defaultDatasetId"]
-    dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?format=json&token={APIFY_API_KEY}"
+    # Get the dataset ID if we don't have it yet
+    if dataset_id is None:
+        dataset_id = status_data["data"]["defaultDatasetId"]
+    
+    # Only fetch max_results from the dataset to prevent excessive costs
+    dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?format=json&limit={max_results}&token={APIFY_API_KEY}"
     
     try:
         timeout = getattr(settings, 'INDEED_TIMEOUT', 120)
@@ -266,7 +335,12 @@ def search_indeed_jobs(
         data_response.raise_for_status()
         jobs_data = data_response.json()
         
-        logger.info(f"Retrieved {len(jobs_data)} jobs from Apify")
+        # Safety check: ensure we never return more than max_results
+        if len(jobs_data) > max_results:
+            logger.warning(f"Dataset returned {len(jobs_data)} jobs, limiting to {max_results}")
+            jobs_data = jobs_data[:max_results]
+        
+        logger.info(f"Retrieved {len(jobs_data)} jobs from Apify (requested: {max_results})")
     except requests.RequestException as e:
         logger.error(f"Failed to retrieve jobs from Apify dataset: {e}")
         raise
