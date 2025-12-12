@@ -8,10 +8,11 @@ from typing import Optional, List
 from contextlib import asynccontextmanager
 
 import requests
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
+from datetime import datetime, timedelta
 
 from settings import settings, RAPID_API_KEY
 from models.schemas import JobScannerInput, JobScannerOutput, JobScannerResponse
@@ -21,6 +22,11 @@ from utils.linkedin_jobspy_service import search_linkedin_jobs
 from services.cache_service import JobCache
 from middleware import RequestIDMiddleware, RateLimitMiddleware, APIKeyAuthMiddleware
 from utils.error_handler import handle_exception, log_error_with_context
+from routes import auth_router
+from services.auth_service import get_password_hash
+from services.supabase_service import supabase_service
+from services.session_service import initialize_session_manager, session_manager
+from migrations.create_sessions_table import run_migration
 
 # Configure logging
 def setup_logging():
@@ -88,12 +94,94 @@ async def lifespan(app: FastAPI):
         except ValueError as e:
             logger.error(f"Environment validation failed: {e}")
             raise
+    
+    # Initialize session manager with Supabase
+    try:
+        initialize_session_manager(supabase_service.client)
+        logger.info("Session manager initialized successfully")
+        
+        # Run database migration for sessions table
+        run_migration(supabase_service.client)
+    except Exception as e:
+        logger.error(f"Error initializing session manager: {e}")
+    
+    # Initialize default user in Supabase
+    try:
+        from services.auth_service import get_password_hash
+        
+        # Get credentials from settings
+        username = settings.DEFAULT_USER_USERNAME
+        password = settings.DEFAULT_USER_PASSWORD
+        email = settings.DEFAULT_USER_EMAIL
+        full_name = settings.DEFAULT_USER_FULL_NAME
+        
+        # Validate credentials are not empty
+        if not username or not password:
+            logger.warning("Default user credentials not configured in .env file - skipping user creation")
+            logger.info("Add DEFAULT_USER_USERNAME and DEFAULT_USER_PASSWORD to .env to create default user")
+        else:
+            # Create user with hashed password
+            hashed_password = get_password_hash(password)
+            success = supabase_service.initialize_default_user(
+                username=username,
+                password=password,
+                email=email,
+                full_name=full_name,
+                hashed_password=hashed_password
+            )
+            if success:
+                logger.info(f"Default user '{username}' initialization completed")
+            else:
+                logger.warning("Default user initialization failed - please check Supabase connection")
+    except Exception as e:
+        logger.error(f"Error initializing default user: {e}")
+    
+    # Start background task for session cleanup
+    cleanup_task = None
+    try:
+        async def cleanup_sessions_periodically():
+            """Background task to cleanup expired sessions every 5 minutes"""
+            while True:
+                try:
+                    await asyncio.sleep(300)  # 5 minutes
+                    if session_manager:
+                        count = session_manager.cleanup_expired_sessions()
+                        if count > 0:
+                            logger.info(f"Background cleanup removed {count} expired session(s)")
+                except Exception as e:
+                    logger.error(f"Error in session cleanup task: {e}")
+        
+        cleanup_task = asyncio.create_task(cleanup_sessions_periodically())
+        logger.info("Session cleanup background task started")
+    except Exception as e:
+        logger.error(f"Error starting session cleanup task: {e}")
 
     # Hand control back to FastAPI/Uvicorn
     yield
+    
+    # Cancel cleanup task on shutdown
+    if cleanup_task:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        logger.info("Session cleanup task stopped")
 
     # Shutdown (Uvicorn handles signal-based graceful shutdown)
     logger.info("Shutting down Job Search API")
+
+# Default user credentials for initialization
+# Read from environment variables to avoid committing secrets to git
+def get_default_user_credentials():
+    """Get default user credentials from settings and hash the password"""
+    return {
+        "username": settings.DEFAULT_USER_USERNAME,
+        "password": settings.DEFAULT_USER_PASSWORD,
+        "full_name": settings.DEFAULT_USER_FULL_NAME,
+        "email": settings.DEFAULT_USER_EMAIL,
+        "hashed_password": get_password_hash(settings.DEFAULT_USER_PASSWORD),
+    }
 
 app = FastAPI(
     title="Job Search API",
@@ -104,6 +192,12 @@ app = FastAPI(
     redoc_url="/redoc" if settings.ENVIRONMENT != "production" else None,
 )
 
+# Include authentication router
+app.include_router(auth_router)
+
+# pwd = get_password_hash("mardy")
+# print(pwd)
+
 cache = JobCache()
 
 # Add middleware in order (last added is first executed)
@@ -112,7 +206,7 @@ app.add_middleware(RequestIDMiddleware)
 # 2. Rate limiting
 app.add_middleware(RateLimitMiddleware)
 # 3. Authentication
-app.add_middleware(APIKeyAuthMiddleware)
+# app.add_middleware(APIKeyAuthMiddleware)
 # 4. CORS (should be last)
 app.add_middleware(
     CORSMiddleware,
