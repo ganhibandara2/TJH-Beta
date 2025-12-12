@@ -44,6 +44,17 @@ class Settings(BaseSettings):
     # CORS - stored as string to avoid Pydantic's automatic JSON parsing
     CORS_ORIGINS_RAW: str = ""
     
+    # JWT Authentication Settings
+    JWT_SECRET_KEY: str = "" # Default key for development
+    JWT_ALGORITHM: str = ""
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 480
+    
+    # Default User Credentials (for initial setup)
+    DEFAULT_USER_USERNAME: str = ""
+    DEFAULT_USER_PASSWORD: str = ""
+    DEFAULT_USER_EMAIL: str = ""
+    DEFAULT_USER_FULL_NAME: str = ""
+    
     # Environment
     ENVIRONMENT: str = "development"  # development, staging, production
     
