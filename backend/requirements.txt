@@ -81,7 +81,7 @@ python-jobspy==1.1.79
 python-jose==3.5.0
 python-multipart==0.0.20
 pytz==2025.2
-pywin32==306
+# pywin32==306
 pyyaml==6.0.3
 realtime==2.24.0
 referencing==0.36.2
@@ -114,4 +114,5 @@ watchfiles==1.1.1
 websockets==15.0.1
 wrapt==2.0.1
 yarl==1.22.0
+
 
