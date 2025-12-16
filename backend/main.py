@@ -19,6 +19,7 @@ from models.schemas import JobScannerInput, JobScannerOutput, JobScannerResponse
 from utils.job_scanner import scan_jobs
 from utils.indeed_service import search_indeed_jobs, normalize_indeed_job, abort_indeed_run, get_indeed_run_status
 from utils.linkedin_jobspy_service import search_linkedin_jobs
+from utils.countries import get_all_countries, get_country_code as get_country_code_from_input
 from services.cache_service import JobCache
 from middleware import RequestIDMiddleware, RateLimitMiddleware, APIKeyAuthMiddleware
 from utils.error_handler import handle_exception, log_error_with_context
@@ -315,6 +316,13 @@ class JobSearchResponse(BaseModel):
 @app.get("/")
 async def root():
     return {"message": "Job Search API is running"}
+
+@app.get("/api/countries")
+async def list_countries():
+    """
+    Get list of all countries with codes and flags for the dropdown.
+    """
+    return {"countries": get_all_countries()}
 
 @app.get("/health")
 async def health():
@@ -823,25 +831,27 @@ async def search_jobs_indeed_endpoint(request: JobSearchRequest):
             return JobSearchResponse(**cached.data)
         logger.info("Indeed cache miss")
 
-        # Build location string from city and country
-        location_parts = []
-        if request.city:
-            location_parts.append(request.city)
-        if request.country:
-            location_parts.append(request.country)
-        location = ", ".join(location_parts) if location_parts else (request.country or "")
+        # Build location string from city (country is now handled separately as country_code)
+        location = request.city or ""
+        
+        # Get country code for Indeed domain selection
+        country_code = request.country if request.country else None
         
         # Call Indeed scraper (Apify API) - run in executor since it's sync
-        logger.info(f"Searching Indeed for '{request.jobTitle}' in '{location}'")
+        logger.info(f"Searching Indeed for '{request.jobTitle}' in '{location}' (country: {country_code or 'US'})")
         loop = asyncio.get_event_loop()
-        jobs_data = await loop.run_in_executor(
-            None,
+        
+        # Use functools.partial to pass keyword arguments
+        from functools import partial
+        search_fn = partial(
             search_indeed_jobs,
-            request.jobTitle,
-            location,
-            20,  # max_results - capped at 20 to control Apify costs
-            request.datePosted or None  # date_posted filter
+            job_title=request.jobTitle,
+            location=location,
+            max_results=20,  # capped at 20 to control Apify costs
+            date_posted=request.datePosted or None,
+            country_code=country_code
         )
+        jobs_data = await loop.run_in_executor(None, search_fn)
         
         # Normalize and convert to response format
         job_responses = []
@@ -950,13 +960,11 @@ async def search_jobs_indeed_stream(request: JobSearchRequest):
                 return
             logger.info("Indeed cache miss (streaming)")
             
-            # Build location string from city and country
-            location_parts = []
-            if request.city:
-                location_parts.append(request.city)
-            if request.country:
-                location_parts.append(request.country)
-            location = ", ".join(location_parts) if location_parts else (request.country or "")
+            # Build location string from city (country is now handled separately as country_code)
+            location = request.city or ""
+            
+            # Get country code for Indeed domain selection
+            country_code = request.country if request.country else None
             
             max_results = 20
             # Use thread-safe queue for progress updates (larger size to prevent blocking)
@@ -996,17 +1004,19 @@ async def search_jobs_indeed_stream(request: JobSearchRequest):
             # Wait a bit for run_id to be set
             await asyncio.sleep(0.5)
             
-            # Run search in background
-            search_task = loop.run_in_executor(
-                None,
+            # Run search in background with country_code support
+            from functools import partial
+            search_fn = partial(
                 search_indeed_jobs,
-                request.jobTitle,
-                location,
-                max_results,
-                request.datePosted or None,
-                None,  # actor_id
-                progress_callback
+                job_title=request.jobTitle,
+                location=location,
+                max_results=max_results,
+                date_posted=request.datePosted or None,
+                actor_id=None,
+                progress_callback=progress_callback,
+                country_code=country_code
             )
+            search_task = loop.run_in_executor(None, search_fn)
             
             # Monitor progress while search runs
             last_count = -1  # Start at -1 so first update (0) always sends
@@ -1183,37 +1193,8 @@ async def get_indeed_search_status(run_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
 
 def get_country_code(country_name: str) -> Optional[str]:
-    """Convert country name to country code"""
-    country_map = {
-        "united states": "US",
-        "usa": "US",
-        "us": "US",
-        "united kingdom": "GB",
-        "uk": "GB",
-        "canada": "CA",
-        "australia": "AU",
-        "germany": "DE",
-        "france": "FR",
-        "spain": "ES",
-        "italy": "IT",
-        "netherlands": "NL",
-        "sweden": "SE",
-        "norway": "NO",
-        "denmark": "DK",
-        "finland": "FI",
-        "poland": "PL",
-        "india": "IN",
-        "china": "CN",
-        "japan": "JP",
-        "south korea": "KR",
-        "singapore": "SG",
-        "brazil": "BR",
-        "mexico": "MX",
-        "argentina": "AR",
-        "south africa": "ZA",
-    }
-    normalized = country_name.lower().strip()
-    return country_map.get(normalized, normalized.upper() if len(normalized) == 2 else None)
+    """Convert country name to country code using the comprehensive countries module."""
+    return get_country_code_from_input(country_name)
 
 
 @app.post("/api/jobs/linkedin/stream")

@@ -15,6 +15,8 @@ from settings import APIFY_API_KEY, APIFY_ACTOR_ID, settings
 logger = logging.getLogger(__name__)
 
 # Apify Indeed Scraper Actor ID (from settings)
+# Note: The Apify actor handles country-specific Indeed domains automatically
+# via the 'country' parameter in the payload (e.g., "US", "AU", "GB")
 
 
 def _parse_indeed_date(date_str: Optional[str]) -> str:
@@ -155,18 +157,20 @@ def search_indeed_jobs(
     max_results: int = 20,
     date_posted: Optional[str] = None,
     actor_id: Optional[str] = None,
-    progress_callback: Optional[Callable[[int, int, str, Optional[str]], None]] = None
+    progress_callback: Optional[Callable[[int, int, str, Optional[str]], None]] = None,
+    country_code: Optional[str] = None
 ) -> List[Dict[str, Any]]:
     """
     Search for jobs on Indeed using Apify API.
     
     Args:
         job_title: Job title to search for
-        location: Location to search in (e.g., "Canada", "US", "New York")
+        location: Location to search in (e.g., "New York", "London", "Mumbai")
         max_results: Maximum number of jobs to return (default: 20)
         date_posted: Filter by date posted ("24h", "day", "today", "week", "anytime", "all", or None)
         actor_id: Apify actor ID (default: uses DEFAULT_ACTOR_ID)
         progress_callback: Optional callback function(count: int, max_results: int, status: str, run_id: str) to report progress
+        country_code: ISO 2-letter country code (e.g., "US", "GB", "IN") - determines which Indeed domain to use
     
     Returns:
         List of job dictionaries filtered by date_posted if specified
@@ -180,13 +184,7 @@ def search_indeed_jobs(
     # Use provided actor_id or from settings
     actor = actor_id or APIFY_ACTOR_ID
     
-    # Build Indeed search URL
-    if location:
-        search_url = f"https://www.indeed.com/jobs?q={job_title}&l={location}"
-    else:
-        search_url = f"https://www.indeed.com/jobs?q={job_title}"
-    
-    logger.info(f"Starting Apify scraper for '{job_title}' in '{location}'")
+    logger.info(f"Starting Apify scraper for '{job_title}' in '{location}' (country: {country_code or 'US'})")
     
     # Trigger the Apify actor run
     # Apify actor IDs use format: username~actor-name (with tilde, not slash)
@@ -196,10 +194,20 @@ def search_indeed_jobs(
         logger.info(f"Converted actor ID format to use tilde: {actor}")
     
     run_url = f"https://api.apify.com/v2/acts/{actor}/runs?token={APIFY_API_KEY}"
+    
+    # Build payload using the documented Apify Indeed scraper input format
+    # See: https://apify.com/misceres/indeed-scraper
+    # Parameters: country, location, position, maxItems, etc.
     payload = {
-        "startUrls": [{"url": search_url}],
-        "maxResults": max_results
+        "position": job_title,
+        "location": location if location else "",
+        "country": country_code.upper() if country_code else "US",
+        "maxItems": max_results,
+        "saveOnlyUniqueItems": True,
+        "maxConcurrency": 5
     }
+    
+    logger.info(f"Apify payload: position='{job_title}', location='{location}', country='{payload['country']}', maxItems={max_results}")
     
     try:
         timeout = getattr(settings, 'INDEED_TIMEOUT', 120)
@@ -421,9 +429,20 @@ def search_indeed_jobs(
     
     # Clean and normalize the jobs
     cleaned_jobs = []
-    for job in jobs_data:
+    for idx, job in enumerate(jobs_data):
+        # Debug: Log raw job data for troubleshooting (first 3 jobs only)
+        if idx < 3:
+            logger.debug(f"Raw job {idx}: {list(job.keys())}")
+        
         # Convert HTML description to plain text
-        desc_html = job.get("descriptionHTML", "") or job.get("description", "")
+        # Try multiple possible field names
+        desc_html = (
+            job.get("descriptionHTML") or 
+            job.get("description") or 
+            job.get("jobDescription") or 
+            job.get("snippet") or 
+            ""
+        )
         desc_text = ""
         if desc_html:
             try:
@@ -433,11 +452,16 @@ def search_indeed_jobs(
                 logger.debug(f"Could not parse description HTML: {e}")
                 desc_text = str(desc_html)
         
-        # Extract location components
-        location_str = job.get("location", "") or ""
+        # Extract location - try multiple field names
+        location_str = (
+            job.get("location") or 
+            job.get("jobLocation") or 
+            job.get("formattedLocation") or
+            ""
+        )
         city = ""
         state = ""
-        country = ""
+        country_val = ""
         
         if location_str:
             parts = [p.strip() for p in location_str.split(",")]
@@ -446,11 +470,18 @@ def search_indeed_jobs(
             if len(parts) >= 2:
                 state = parts[1]
             if len(parts) >= 3:
-                country = parts[2]
+                country_val = parts[2]
         
         # Determine if remote
         remote = False
-        job_type_str = ", ".join(job.get("jobType", [])) if job.get("jobType") else ""
+        job_type_raw = job.get("jobType") or job.get("jobTypes") or job.get("employmentType") or []
+        if isinstance(job_type_raw, str):
+            job_type_str = job_type_raw
+        elif isinstance(job_type_raw, list):
+            job_type_str = ", ".join(job_type_raw)
+        else:
+            job_type_str = ""
+            
         if job_type_str:
             job_type_lower = job_type_str.lower()
             if "remote" in job_type_lower:
@@ -458,23 +489,69 @@ def search_indeed_jobs(
             if "hybrid" in job_type_lower:
                 remote = True
         
-        # Parse and normalize the date
-        raw_date = job.get("postedAt") or ""
+        # Parse and normalize the date - try multiple fields
+        raw_date = (
+            job.get("postedAt") or 
+            job.get("datePosted") or 
+            job.get("postDate") or 
+            job.get("date") or
+            ""
+        )
         normalized_date = _parse_indeed_date(raw_date)
         
+        # Extract job title - try multiple field names
+        job_title = (
+            job.get("positionName") or 
+            job.get("title") or 
+            job.get("jobTitle") or 
+            job.get("name") or
+            ""
+        )
+        
+        # Extract company - try multiple fields
+        company = (
+            job.get("company") or 
+            job.get("companyName") or 
+            job.get("employer") or
+            ""
+        )
+        
+        # Extract URL/link - try multiple fields
+        job_url = (
+            job.get("externalApplyLink") or 
+            job.get("url") or 
+            job.get("jobUrl") or 
+            job.get("link") or 
+            job.get("applyUrl") or
+            ""
+        )
+        
+        # Extract salary - try multiple fields
+        salary = (
+            job.get("salary") or 
+            job.get("salaryRange") or 
+            job.get("estimatedSalary") or 
+            job.get("compensation") or
+            ""
+        )
+        
+        # Log warning if essential fields are missing
+        if not job_title:
+            logger.warning(f"Job {idx} has no title. Available fields: {list(job.keys())}")
+        
         cleaned_jobs.append({
-            "title": job.get("positionName") or "",
-            "company": job.get("company") or "",
+            "title": job_title,
+            "company": company,
             "location": location_str,
             "city": city,
             "state": state,
-            "country": country,
-            "url": job.get("externalApplyLink") or job.get("url") or "",
+            "country": country_val,
+            "url": job_url,
             "date_posted": normalized_date,
             "description": desc_text[:500] if desc_text else "",  # Limit description length
             "employment_type": job_type_str,
             "remote": remote,
-            "salary": job.get("salary") or "",
+            "salary": salary if isinstance(salary, str) else str(salary) if salary else "",
             "rating": job.get("rating"),
             "reviews_count": job.get("reviewsCount"),
         })
