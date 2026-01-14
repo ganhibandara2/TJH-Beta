@@ -220,9 +220,12 @@ class SupabaseService:
         """
         Retrieve jobs from the database with optional filtering.
         
+        Searches by job title and location for more flexible matching.
+        This is designed for the "normal" Indeed search that queries cached jobs.
+        
         Args:
-            query: Filter by search query (optional)
-            location: Filter by search location (optional)
+            query: Filter by job title (case-insensitive partial match)
+            location: Filter by job location (case-insensitive partial match)
             limit: Maximum number of jobs to return
             
         Returns:
@@ -231,15 +234,25 @@ class SupabaseService:
         try:
             db_query = self.client.table("jobs").select("*")
             
+            # Search by title (more useful than search_query field)
             if query:
-                db_query = db_query.ilike("search_query", f"%{query}%")
-            if location:
-                db_query = db_query.ilike("search_location", f"%{location}%")
+                db_query = db_query.ilike("title", f"%{query}%")
             
+            # Search by location - extract just the city for more flexible matching
+            if location:
+                # Get just the city part (before any comma)
+                city = location.split(",")[0].strip()
+                logger.info(f"Searching by city: '{city}' (from location: '{location}')")
+                if city:
+                    db_query = db_query.ilike("location", f"%{city}%")
+            
+            # Order by most recent first
             db_query = db_query.order("scraped_at", desc=True).limit(limit)
             
             response = db_query.execute()
-            return response.data if response.data else []
+            jobs = response.data if response.data else []
+            logger.info(f"Retrieved {len(jobs)} jobs from database (query='{query}', location='{location}')")
+            return jobs
             
         except Exception as e:
             logger.error(f"Error retrieving jobs: {e}")

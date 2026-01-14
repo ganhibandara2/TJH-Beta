@@ -148,7 +148,7 @@ def _build_cdp_url() -> str:
 def _scrape_indeed_jobs_sync(
     query: str,
     location: str = "",
-    max_results: int = 20,
+    time_limit_seconds: int = 60,
     country_code: str = "US"
 ) -> List[Dict[str, Any]]:
     """
@@ -156,9 +156,19 @@ def _scrape_indeed_jobs_sync(
     
     This avoids Windows asyncio subprocess issues with uvicorn --reload.
     Decorated with @retry_with_backoff for automatic retry on transient failures.
-    """
-    max_results = min(max_results, 100)  # Cap at 100
     
+    Uses a TIME-BASED approach: scrapes as many jobs as possible within the time limit.
+    This is more practical than a fixed job count since scraping speed varies.
+    
+    Args:
+        query: Job search query
+        location: Location to search in
+        time_limit_seconds: Maximum time to spend scraping (default: 60 seconds)
+        country_code: ISO 2-letter country code
+    
+    Returns:
+        List of scraped job dictionaries
+    """
     # Map country code to Indeed domain
     domain_map = {
         "US": "www.indeed.com",
@@ -178,7 +188,7 @@ def _scrape_indeed_jobs_sync(
     if location:
         search_url += f"&l={quote(location)}"
     
-    logger.info(f"Starting Bright Data deep scrape: query='{query}', location='{location}', max={max_results}")
+    logger.info(f"Starting Bright Data deep scrape: query='{query}', location='{location}', time_limit={time_limit_seconds}s")
     logger.info(f"Target URL: {search_url}")
     
     try:
@@ -189,6 +199,19 @@ def _scrape_indeed_jobs_sync(
     
     jobs: List[Dict[str, Any]] = []
     browser: Optional[Browser] = None
+    scrape_start_time = time.time()
+    
+    def time_remaining() -> float:
+        """Calculate remaining scrape time."""
+        return time_limit_seconds - (time.time() - scrape_start_time)
+    
+    def should_continue() -> bool:
+        """Check if we should continue scraping."""
+        remaining = time_remaining()
+        if remaining <= 5:  # Leave 5 seconds buffer for cleanup
+            logger.info(f"Time limit approaching ({remaining:.1f}s remaining), stopping scrape")
+            return False
+        return True
     
     logger.info("Initializing Playwright sync API...")
     with sync_playwright() as playwright:
@@ -198,7 +221,6 @@ def _scrape_indeed_jobs_sync(
             logger.info("Attempting to connect to Bright Data Scraping Browser via CDP...")
             logger.info("Connection timeout set to 120 seconds...")
             
-            import time
             connect_start = time.time()
             browser = playwright.chromium.connect_over_cdp(
                 cdp_url,
@@ -241,11 +263,13 @@ def _scrape_indeed_jobs_sync(
             # Scrape jobs from current page
             page_jobs = _extract_jobs_from_page_sync(page, domain)
             jobs.extend(page_jobs)
-            logger.info(f"Scraped {len(page_jobs)} jobs from page 1")
+            logger.info(f"Scraped {len(page_jobs)} jobs from page 1 (total: {len(jobs)}, {time_remaining():.1f}s remaining)")
             
-            # Paginate if needed
+            # Paginate while time allows
             page_num = 2
-            while len(jobs) < max_results:
+            max_pages = 10  # Safety limit
+            
+            while should_continue() and page_num <= max_pages:
                 # Check for next page button
                 next_button = page.query_selector('[data-testid="pagination-page-next"]')
                 if not next_button:
@@ -264,13 +288,8 @@ def _scrape_indeed_jobs_sync(
                     break
                     
                 jobs.extend(page_jobs)
-                logger.info(f"Scraped {len(page_jobs)} jobs from page {page_num} (total: {len(jobs)})")
+                logger.info(f"Scraped {len(page_jobs)} jobs from page {page_num} (total: {len(jobs)}, {time_remaining():.1f}s remaining)")
                 page_num += 1
-                
-                # Safety limit on pages
-                if page_num > 10:
-                    logger.info("Reached maximum page limit (10)")
-                    break
             
         except PlaywrightTimeout as e:
             logger.error(f"Playwright Timeout Error: {e}")
@@ -294,8 +313,6 @@ def _scrape_indeed_jobs_sync(
             else:
                 logger.warning("No browser connection to close")
     
-    # Trim to max_results
-    jobs = jobs[:max_results]
     logger.info(f"Deep scrape complete: {len(jobs)} jobs retrieved")
     
     return jobs
@@ -353,15 +370,28 @@ def _parse_job_card_sync(card, domain: str) -> Dict[str, Any]:
     if location_el:
         job["location"] = location_el.inner_text().strip()
     
-    # Extract salary if available
-    salary_el = card.query_selector('[data-testid="attribute_snippet_testid"], .salary-snippet-container')
-    if salary_el:
-        job["salary"] = salary_el.inner_text().strip()
+    # Extract salary - look for salary snippet directly
+    try:
+        salary_el = card.query_selector('.salary-snippet-container, [data-testid="attribute_snippet_testid"]')
+        if salary_el:
+            salary_text = salary_el.inner_text().strip()
+            # Check if it looks like a salary (has currency symbol)
+            if '$' in salary_text or '£' in salary_text or '€' in salary_text or 'year' in salary_text.lower():
+                job["salary"] = salary_text
+            else:
+                # It's probably job type instead
+                job["job_type"] = salary_text
+    except Exception:
+        pass
     
-    # Extract job type/metadata
-    metadata_el = card.query_selector('.metadata')
-    if metadata_el:
-        job["job_type"] = metadata_el.inner_text().strip()
+    # Extract job type from metadata if not already set
+    if not job["job_type"]:
+        try:
+            metadata_el = card.query_selector('.metadata')
+            if metadata_el:
+                job["job_type"] = metadata_el.inner_text().strip()
+        except Exception:
+            pass
     
     # Extract job snippet/description
     snippet_el = card.query_selector('.job-snippet, [data-testid="jobDescriptionText"]')
@@ -391,7 +421,7 @@ def _parse_job_card_sync(card, domain: str) -> Dict[str, Any]:
 async def scrape_indeed_jobs(
     query: str,
     location: str = "",
-    max_results: int = 20,
+    time_limit_seconds: int = 60,
     country_code: str = "US"
 ) -> List[Dict[str, Any]]:
     """
@@ -403,13 +433,16 @@ async def scrape_indeed_jobs(
     This async function runs the sync Playwright code in a thread pool to avoid
     Windows asyncio subprocess issues with uvicorn --reload.
     
+    TIME-BASED APPROACH: Scrapes as many jobs as possible within the time limit
+    (default: 60 seconds). This is more practical than a fixed job count.
+    
     RELIABILITY: Automatically retries up to 3 times with exponential backoff 
     (2s, 4s, 8s delays) on transient failures like timeouts or connection errors.
     
     Args:
         query: Job title/keywords to search for
         location: Location to search in
-        max_results: Maximum number of jobs to scrape (default: 20, max: 100)
+        time_limit_seconds: Maximum time to spend scraping (default: 60 seconds)
         country_code: ISO 2-letter country code (default: "US")
     
     Returns:
@@ -427,10 +460,182 @@ async def scrape_indeed_jobs(
             _scrape_indeed_jobs_sync,
             query=query,
             location=location,
-            max_results=max_results,
+            time_limit_seconds=time_limit_seconds,
             country_code=country_code
         )
     )
+
+
+# Shared progress state for streaming
+import queue
+from typing import AsyncGenerator
+
+_progress_queues: Dict[str, queue.Queue] = {}
+
+
+def _scrape_with_progress_sync(
+    query: str,
+    location: str,
+    time_limit_seconds: int,
+    country_code: str,
+    progress_queue: queue.Queue
+) -> List[Dict[str, Any]]:
+    """
+    Sync scraping function that reports progress to a queue.
+    """
+    start_time = time.time()
+    
+    def send_progress(status: str, jobs_count: int):
+        elapsed = time.time() - start_time
+        remaining = max(0, time_limit_seconds - elapsed)
+        progress_queue.put({
+            "type": "progress",
+            "time_remaining": int(remaining),
+            "jobs_collected": jobs_count,
+            "status": status
+        })
+    
+    # Map country code to domain
+    domain_map = {
+        "US": "www.indeed.com", "GB": "uk.indeed.com", "CA": "ca.indeed.com",
+        "AU": "au.indeed.com", "IN": "in.indeed.com", "DE": "de.indeed.com",
+        "FR": "fr.indeed.com", "NL": "nl.indeed.com", "SG": "sg.indeed.com",
+    }
+    domain = domain_map.get(country_code.upper(), "www.indeed.com")
+    search_url = f"https://{domain}/jobs?q={quote(query)}"
+    if location:
+        search_url += f"&l={quote(location)}"
+    
+    send_progress("Connecting to Bright Data...", 0)
+    
+    try:
+        cdp_url = _build_cdp_url()
+    except ValueError as e:
+        progress_queue.put({"type": "error", "message": str(e)})
+        return []
+    
+    jobs: List[Dict[str, Any]] = []
+    browser: Optional[Browser] = None
+    
+    def time_remaining() -> float:
+        return time_limit_seconds - (time.time() - start_time)
+    
+    def should_continue() -> bool:
+        return time_remaining() > 5
+    
+    with sync_playwright() as playwright:
+        try:
+            send_progress("Initializing browser...", 0)
+            browser = playwright.chromium.connect_over_cdp(cdp_url, timeout=120000)
+            
+            context = browser.contexts[0] if browser.contexts else browser.new_context()
+            page = context.pages[0] if context.pages else context.new_page()
+            
+            send_progress(f"Navigating to Indeed...", 0)
+            page.goto(search_url, wait_until="load", timeout=90000)
+            page.wait_for_timeout(3000)
+            
+            # Wait for job cards
+            try:
+                page.wait_for_selector('[data-testid="jobsearch-ResultsList"]', timeout=20000)
+            except PlaywrightTimeout:
+                try:
+                    page.wait_for_selector('.jobsearch-ResultsList', timeout=10000)
+                except PlaywrightTimeout:
+                    page.wait_for_selector('#mosaic-jobResults, .job_seen_beacon', timeout=10000)
+            
+            # Scrape page 1
+            page_jobs = _extract_jobs_from_page_sync(page, domain)
+            jobs.extend(page_jobs)
+            send_progress(f"Scraped page 1...", len(jobs))
+            
+            # Paginate
+            page_num = 2
+            while should_continue() and page_num <= 10:
+                next_button = page.query_selector('[data-testid="pagination-page-next"]')
+                if not next_button:
+                    break
+                
+                next_button.click()
+                page.wait_for_load_state("domcontentloaded")
+                page.wait_for_timeout(2000)
+                
+                page_jobs = _extract_jobs_from_page_sync(page, domain)
+                if not page_jobs:
+                    break
+                
+                jobs.extend(page_jobs)
+                send_progress(f"Scraped page {page_num}...", len(jobs))
+                page_num += 1
+                
+        except Exception as e:
+            progress_queue.put({"type": "error", "message": str(e)})
+        finally:
+            if browser:
+                try:
+                    browser.close()
+                except:
+                    pass
+    
+    # Signal completion
+    progress_queue.put({"type": "jobs", "jobs": jobs})
+    return jobs
+
+
+async def scrape_indeed_jobs_with_progress(
+    query: str,
+    location: str = "",
+    time_limit_seconds: int = 60,
+    country_code: str = "US"
+) -> AsyncGenerator[Dict[str, Any], None]:
+    """
+    Async generator that yields progress updates during scraping.
+    
+    Yields:
+        {"type": "progress", "time_remaining": X, "jobs_collected": Y, "status": "..."}
+        {"type": "jobs", "jobs": [...]} (final result)
+        {"type": "error", "message": "..."} (on error)
+    """
+    progress_queue: queue.Queue = queue.Queue()
+    
+    # Start scraping in background thread
+    loop = asyncio.get_event_loop()
+    task = loop.run_in_executor(
+        _executor,
+        partial(
+            _scrape_with_progress_sync,
+            query=query,
+            location=location,
+            time_limit_seconds=time_limit_seconds,
+            country_code=country_code,
+            progress_queue=progress_queue
+        )
+    )
+    
+    # Yield progress updates
+    while True:
+        try:
+            # Non-blocking check for progress
+            await asyncio.sleep(0.5)  # Check every 500ms
+            
+            while not progress_queue.empty():
+                update = progress_queue.get_nowait()
+                yield update
+                
+                # If we got jobs or error, we're done
+                if update.get("type") in ("jobs", "error"):
+                    return
+                    
+        except Exception as e:
+            yield {"type": "error", "message": str(e)}
+            return
+        
+        # Check if task is done
+        if task.done():
+            # Drain remaining queue items
+            while not progress_queue.empty():
+                yield progress_queue.get_nowait()
+            return
 
 
 def _test_connection_sync() -> Dict[str, Any]:
