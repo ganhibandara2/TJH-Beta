@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from supabase import create_client, Client
 from settings import settings
 
@@ -162,7 +162,90 @@ class SupabaseService:
         except Exception as e:
             logger.error(f"Error initializing default user: {e}")
             return False
+    
+    # ========== Job Methods ==========
+    
+    def save_jobs(self, jobs: List[Dict[str, Any]], search_query: str = "", 
+                  search_location: str = "") -> int:
+        """
+        Save scraped jobs to the jobs table with upsert (insert or update).
+        
+        Args:
+            jobs: List of job dictionaries
+            search_query: Original search query
+            search_location: Original search location
+            
+        Returns:
+            Number of jobs saved/updated
+        """
+        if not jobs:
+            return 0
+        
+        saved_count = 0
+        for job in jobs:
+            try:
+                job_data = {
+                    "job_id": job.get("job_id", ""),
+                    "title": job.get("title", ""),
+                    "company": job.get("company", ""),
+                    "location": job.get("location", ""),
+                    "salary": job.get("salary", ""),
+                    "job_type": job.get("job_type", ""),
+                    "description": job.get("description", "")[:1000] if job.get("description") else "",
+                    "apply_url": job.get("apply_url", ""),
+                    "source": job.get("source", "indeed"),
+                    "scraped_at": job.get("scraped_at"),
+                    "search_query": search_query,
+                    "search_location": search_location,
+                }
+                
+                # Upsert: insert or update on conflict
+                response = self.client.table("jobs").upsert(
+                    job_data,
+                    on_conflict="job_id"
+                ).execute()
+                
+                if response.data:
+                    saved_count += 1
+                    
+            except Exception as e:
+                logger.error(f"Error saving job '{job.get('title', 'unknown')}': {e}")
+                continue
+        
+        logger.info(f"Saved {saved_count} of {len(jobs)} jobs to database")
+        return saved_count
+    
+    def get_jobs(self, query: str = "", location: str = "", 
+                 limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Retrieve jobs from the database with optional filtering.
+        
+        Args:
+            query: Filter by search query (optional)
+            location: Filter by search location (optional)
+            limit: Maximum number of jobs to return
+            
+        Returns:
+            List of job dictionaries
+        """
+        try:
+            db_query = self.client.table("jobs").select("*")
+            
+            if query:
+                db_query = db_query.ilike("search_query", f"%{query}%")
+            if location:
+                db_query = db_query.ilike("search_location", f"%{location}%")
+            
+            db_query = db_query.order("scraped_at", desc=True).limit(limit)
+            
+            response = db_query.execute()
+            return response.data if response.data else []
+            
+        except Exception as e:
+            logger.error(f"Error retrieving jobs: {e}")
+            return []
 
 
 # Global instance
 supabase_service = SupabaseService()
+

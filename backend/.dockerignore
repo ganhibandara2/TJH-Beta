@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv
+venv
+ENV
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Test and coverage
+.pytest_cache
+.coverage
+htmlcov
+.tox
+
+# Build
+*.egg-info
+dist
+build
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database files (local)
+*.db
+*.sqlite3
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Lock files (keep requirements.txt, exclude uv.lock for smaller image)
+uv.lock

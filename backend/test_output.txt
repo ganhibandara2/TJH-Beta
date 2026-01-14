@@ -1,0 +1,61 @@
+﻿API Key: b839e3b9-b...
+Dataset ID: gd_l4dx9j9sscpvs7no2
+
+============================================================
+SENDING REQUEST TO BRIGHT DATA
+============================================================
+URL: https://api.brightdata.com/datasets/v3/scrape?dataset_id=gd_l4dx9j9sscpvs7no2&include_errors=true&type=discover_new&discover_by=keyword&limit_per_input=10&format=json
+Payload: [
+  {
+    "country": "US",
+    "domain": "indeed.com",
+    "keyword_search": "Software Engineer",
+    "location": "San Francisco",
+    "date_posted": "Last 7 days",
+    "posted_by": "",
+    "location_radius": ""
+  }
+]
+
+Sending request...
+Status Code: 202
+Got snapshot_id: sd_mkcwzuc51v4ow32j7v
+Polling for results...
+  Poll attempt 1...
+
+============================================================
+RESPONSE RECEIVED (after 48.7s)
+============================================================
+Response length: 133263 chars
+Got JSON array with 13 items
+Filtered to 13 job items
+
+============================================================
+FIRST JOB FOUND:
+============================================================
+{
+  "timestamp": "2026-01-13T18:18:10.404Z",
+  "input": {
+    "country": "US",
+    "domain": "indeed.com",
+    "keyword_search": "Software Engineer",
+    "location": "San Francisco",
+    "date_posted": "Last 7 days",
+    "posted_by": "",
+    "location_radius": ""
+  },
+  "error": "Jobs not been found",
+  "error_code": "dead_page"
+}
+
+============================================================
+ALL JOB FIELDS IN FIRST RESULT:
+============================================================
+  timestamp: 2026-01-13T18:18:10.404Z
+  input: {'country': 'US', 'domain': 'indeed.com', 'keyword_search': 'Software Engineer', 'location': 'San Francisco', 'date_posted': 'Last 7 days', 'posted_by': '', 'location_radius': ''}
+  error: Jobs not been found
+  error_code: dead_page
+
+============================================================
+TEST COMPLETE
+============================================================

@@ -7,6 +7,15 @@ import queue
 from typing import Optional, List
 from contextlib import asynccontextmanager
 
+# Apply nest_asyncio to fix Playwright compatibility with Uvicorn's reload loop on Windows
+import nest_asyncio
+nest_asyncio.apply()
+
+# Use Proactor event loop policy on Windows for better async I/O support
+# Note: Playwright operations now run in a thread pool with sync API to avoid event loop conflicts
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 import requests
 from fastapi import FastAPI, HTTPException, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,13 +26,14 @@ from datetime import datetime, timedelta
 from settings import settings, RAPID_API_KEY
 from models.schemas import JobScannerInput, JobScannerOutput, JobScannerResponse
 from utils.job_scanner import scan_jobs
-from utils.indeed_service import search_indeed_jobs, normalize_indeed_job, abort_indeed_run, get_indeed_run_status
+from utils.brightdata_service import search_indeed_jobs_brightdata as search_indeed_jobs, normalize_brightdata_job as normalize_indeed_job
 from utils.linkedin_jobspy_service import search_linkedin_jobs
+
 from utils.countries import get_all_countries, get_country_code as get_country_code_from_input
 from services.cache_service import JobCache
 from middleware import RequestIDMiddleware, RateLimitMiddleware, APIKeyAuthMiddleware
 from utils.error_handler import handle_exception, log_error_with_context
-from routes import auth_router
+from routes import auth_router, scrape_router
 from services.auth_service import get_password_hash
 from services.supabase_service import supabase_service
 from services.session_service import initialize_session_manager, session_manager
@@ -72,6 +82,7 @@ logger = logging.getLogger(__name__)
 
 # Use timeout from settings
 REQUEST_TIMEOUT_SECONDS = settings.REQUEST_TIMEOUT_SECONDS
+
 
 # Lifespan context for startup/shutdown
 @asynccontextmanager
@@ -195,6 +206,9 @@ app = FastAPI(
 
 # Include authentication router
 app.include_router(auth_router)
+
+# Include scraping router (Bright Data deep scraping)
+app.include_router(scrape_router)
 
 # pwd = get_password_hash("mardy")
 # print(pwd)
@@ -355,10 +369,10 @@ async def health():
     else:
         health_status["checks"]["rapidapi"] = "configured"
     
-    if not settings.APIFY_API_KEY:
-        health_status["checks"]["apify"] = "missing (Indeed searches will fail)"
+    if not settings.BRIGHTDATA_API_KEY:
+        health_status["checks"]["brightdata"] = "missing (Indeed searches will fail)"
     else:
-        health_status["checks"]["apify"] = "configured"
+        health_status["checks"]["brightdata"] = "configured"
     
     # Return appropriate status code
     status_code = 200 if health_status["status"] == "healthy" else 503
@@ -1012,10 +1026,10 @@ async def search_jobs_indeed_stream(request: JobSearchRequest):
                 location=location,
                 max_results=max_results,
                 date_posted=request.datePosted or None,
-                actor_id=None,
                 progress_callback=progress_callback,
                 country_code=country_code
             )
+
             search_task = loop.run_in_executor(None, search_fn)
             
             # Monitor progress while search runs
@@ -1152,22 +1166,17 @@ async def search_jobs_indeed_stream(request: JobSearchRequest):
 async def abort_indeed_search(run_id: str):
     """
     Abort a running Indeed job search.
+    Note: Bright Data snapshots cannot be cancelled via API - they complete automatically.
     
     Args:
-        run_id: The Apify run ID to abort
+        run_id: The Bright Data snapshot ID
     
     Returns:
-        Success status
+        Message indicating abort is not supported
     """
-    try:
-        success = abort_indeed_run(run_id)
-        if success:
-            return {"success": True, "message": f"Run {run_id} aborted successfully"}
-        else:
-            raise HTTPException(status_code=404, detail=f"Run {run_id} not found or could not be aborted")
-    except Exception as e:
-        logger.error(f"Error aborting Indeed run {run_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to abort run: {str(e)}")
+    # Bright Data doesn't support aborting snapshots via API
+    # The snapshot will complete on its own
+    return {"success": False, "message": f"Bright Data snapshots cannot be aborted. Snapshot {run_id} will complete automatically."}
 
 @app.get("/api/jobs/indeed/status/{run_id}")
 async def get_indeed_search_status(run_id: str):
@@ -1175,22 +1184,14 @@ async def get_indeed_search_status(run_id: str):
     Get the current status of an Indeed job search.
     
     Args:
-        run_id: The Apify run ID
+        run_id: The Bright Data snapshot ID
     
     Returns:
-        Status information including results count
+        Status information
     """
-    try:
-        status = get_indeed_run_status(run_id)
-        if status:
-            return status
-        else:
-            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error getting Indeed run status {run_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
+    # Return a simple status - actual status checking happens during the search
+    return {"snapshot_id": run_id, "status": "running", "message": "Check Bright Data dashboard for detailed status"}
+
 
 def get_country_code(country_name: str) -> Optional[str]:
     """Convert country name to country code using the comprehensive countries module."""

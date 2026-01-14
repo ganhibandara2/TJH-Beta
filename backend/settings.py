@@ -19,8 +19,16 @@ class Settings(BaseSettings):
     SUPABASE_URL: str = ""
     SUPABASE_KEY: str = ""
     MODEL_API_KEY: str = ""
-    APIFY_API_KEY: str = ""
-    APIFY_ACTOR_ID: str = "misceres~indeed-scraper"  # Default Apify Indeed scraper actor (format: username~actor-name)
+    
+    # Bright Data API for Indeed job scraping
+    BRIGHTDATA_API_KEY: str = ""
+    BRIGHTDATA_DATASET_ID: str = "gd_l4dx9j9sscpvs7no2"  # Indeed jobs dataset ID
+    
+    # Bright Data Scraping Browser (Remote Browser via CDP)
+    BRIGHT_DATA_USERNAME: str = ""  # Customer ID
+    BRIGHT_DATA_PASSWORD: str = ""
+    BRIGHT_DATA_HOST: str = "brd.superproxy.io"
+    BRIGHT_DATA_PORT: int = 9222  # CDP port for Scraping Browser
     
     # API Authentication (for HR admins)
     API_KEY: str = ""  # API key for authenticating requests
@@ -119,8 +127,8 @@ class Settings(BaseSettings):
         if self.ENVIRONMENT == "production":
             if not self.API_KEY:
                 errors.append("API_KEY is required in production")
-            if not self.APIFY_API_KEY:
-                errors.append("APIFY_API_KEY is required for Indeed searches")
+            if not self.BRIGHTDATA_API_KEY:
+                errors.append("BRIGHTDATA_API_KEY is required for Indeed searches")
         
         if errors:
             raise ValueError(f"Missing required environment variables:\n" + "\n".join(f"  - {e}" for e in errors))
@@ -144,5 +152,5 @@ DATABASE_URL = settings.DATABASE_URL
 SUPABASE_URL = settings.SUPABASE_URL
 SUPABASE_KEY = settings.SUPABASE_KEY
 MODEL_API_KEY = settings.MODEL_API_KEY
-APIFY_API_KEY = settings.APIFY_API_KEY
-APIFY_ACTOR_ID = settings.APIFY_ACTOR_ID
+BRIGHTDATA_API_KEY = settings.BRIGHTDATA_API_KEY
+BRIGHTDATA_DATASET_ID = settings.BRIGHTDATA_DATASET_ID
